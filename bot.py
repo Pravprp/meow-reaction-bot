@@ -154,9 +154,7 @@ def handle_confirmation(call):
                 {
                     "$set": {
                         "user_id": user_id,
-                        "gender": gender,
-                        "username": call.from_user.username or "",
-                        "first_name": call.from_user.first_name or ""
+                        "gender": gender
                     }
                 },
                 upsert=True
