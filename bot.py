@@ -23,6 +23,12 @@ MM_MEMES_CHAT_ID = int(os.environ.get("MM_MEMES_CHAT_ID") or 0)
 bot = telebot.TeleBot(TOKEN)
 app = Flask(__name__)
 
+# Extract numeric bot ID directly from the token for instant admin checks
+try:
+    BOT_ID = int(TOKEN.split(":")[0])
+except Exception:
+    BOT_ID = 0
+
 # Queue for outgoing messages (1 job at a time, 2-second rate-limit gap)
 reaction_queue = queue.Queue(maxsize=1000)
 
@@ -64,7 +70,17 @@ if MONGO_URI:
     except Exception as e:
         print(f"MongoDB Initialization Error: {e}")
 
-# ---------------- DATABASE HELPERS ----------------
+# ---------------- DATABASE & HELPER FUNCTIONS ----------------
+
+def is_bot_admin(chat_id):
+    """Verifies that the bot is an administrator in the target group."""
+    if not BOT_ID:
+        return False
+    try:
+        member = bot.get_chat_member(chat_id, BOT_ID)
+        return member.status in ['administrator', 'creator']
+    except Exception:
+        return False
 
 def get_user_gender(user_id):
     """Retrieves gender registered via /start ('m' or 'f')."""
@@ -159,39 +175,75 @@ def process_queue():
     while True:
         try:
             job = reaction_queue.get()
-            target_chat_id, storage_chat_id, media_msg_id, reply_to_id, caption_text, queued_time = job
+            job_type = job.get("type")
+            queued_time = job.get("queued_time", time.time())
 
             # Drop stale triggers older than 45 seconds
             if time.time() - queued_time <= 45:
-                try:
-                    bot.copy_message(
-                        chat_id=target_chat_id,
-                        from_chat_id=storage_chat_id,
-                        message_id=media_msg_id,
-                        reply_to_message_id=reply_to_id,
-                        caption=caption_text,
-                        parse_mode="Markdown" if caption_text else None
-                    )
-                except ApiTelegramException as e:
-                    err_msg = str(e).lower()
-                    if "replied message not found" in err_msg or "reply" in err_msg:
-                        try:
-                            bot.copy_message(
-                                chat_id=target_chat_id,
-                                from_chat_id=storage_chat_id,
-                                message_id=media_msg_id,
-                                caption=caption_text,
-                                parse_mode="Markdown" if caption_text else None
-                            )
-                        except Exception:
-                            pass
-                    elif "message to copy not found" in err_msg or "message can't be copied" in err_msg:
-                        remove_dead_media(storage_chat_id, media_msg_id)
-                except Exception as e:
-                    print(f"Queue worker transfer error: {e}")
+                target_chat_id = job["target_chat_id"]
+                storage_chat_id = job["storage_chat_id"]
+                media_msg_id = job["media_msg_id"]
+
+                # Case A: Keyword Reaction in Public Group
+                if job_type == "reaction":
+                    reply_to_id = job.get("reply_to_id")
+                    try:
+                        bot.copy_message(
+                            chat_id=target_chat_id,
+                            from_chat_id=storage_chat_id,
+                            message_id=media_msg_id,
+                            reply_to_message_id=reply_to_id
+                        )
+                    except ApiTelegramException as e:
+                        err_msg = str(e).lower()
+                        if "replied message not found" in err_msg or "reply" in err_msg:
+                            try:
+                                bot.copy_message(
+                                    chat_id=target_chat_id,
+                                    from_chat_id=storage_chat_id,
+                                    message_id=media_msg_id
+                                )
+                            except Exception:
+                                pass
+                        elif "message to copy not found" in err_msg or "message can't be copied" in err_msg:
+                            remove_dead_media(storage_chat_id, media_msg_id)
+                    except Exception as e:
+                        print(f"Reaction transfer error: {e}")
+
+                # Case B: Flirt Dispatch (Send Meme first -> Then Tag in Reply)
+                elif job_type == "flirt":
+                    user_id = job["user_id"]
+                    first_name = job["first_name"]
+                    try:
+                        # 1. Send the meme from the storage group to the target group
+                        sent_msg = bot.copy_message(
+                            chat_id=target_chat_id,
+                            from_chat_id=storage_chat_id,
+                            message_id=media_msg_id
+                        )
+                        sent_msg_id = getattr(sent_msg, 'message_id', sent_msg)
+
+                        # Small 1-second interval before tagging
+                        time.sleep(1)
+
+                        # 2. Tag the target user as a direct reply without saying "Hey"
+                        clean_name = first_name.replace('[', '').replace(']', '')
+                        mention = f"[{clean_name}](tg://user?id={user_id})"
+                        bot.send_message(
+                            chat_id=target_chat_id,
+                            text=mention,
+                            reply_to_message_id=sent_msg_id,
+                            parse_mode="Markdown"
+                        )
+                    except ApiTelegramException as e:
+                        err_msg = str(e).lower()
+                        if "message to copy not found" in err_msg or "message can't be copied" in err_msg:
+                            remove_dead_media(storage_chat_id, media_msg_id)
+                    except Exception as e:
+                        print(f"Flirt transfer error: {e}")
 
             reaction_queue.task_done()
-            time.sleep(2)  # 2-second rate-limit buffer to protect 0.1 CPU
+            time.sleep(2)  # 2-second buffer to protect the 0.1 CPU
 
         except Exception as e:
             print(f"Queue worker exception: {e}")
@@ -216,7 +268,7 @@ def generate_daily_schedule():
     return sorted([m1, m2, a1, e1, e2])
 
 def dispatch_flirts_for_slot(slot_index):
-    """Evaluates all public groups and dispatches flirts dynamically based on user count."""
+    """Evaluates all public groups where bot is admin and dispatches flirts."""
     if public_groups_col is None or group_members_col is None or flirt_media_col is None or flirt_logs_col is None:
         return
 
@@ -229,6 +281,10 @@ def dispatch_flirts_for_slot(slot_index):
 
     for group in public_groups:
         group_id = group["chat_id"]
+
+        # Only dispatch if the bot is an Administrator in this group
+        if not is_bot_admin(group_id):
+            continue
 
         # ---------------- 1. FLIRTS FOR GIRLS ----------------
         if female_media and MMG_FLIRT_CHAT_ID != 0:
@@ -244,8 +300,6 @@ def dispatch_flirts_for_slot(slot_index):
                 if eligible_girls:
                     chosen_girl = random.choice(eligible_girls)
                     media_id = random.choice(female_media)["message_id"]
-                    mention = f"[{chosen_girl['first_name']}](tg://user?id={chosen_girl['user_id']})"
-                    caption = f"Hey {mention} ✨"
 
                     flirt_logs_col.insert_one({
                         "date": today_str,
@@ -256,7 +310,15 @@ def dispatch_flirts_for_slot(slot_index):
                         "timestamp": time.time()
                     })
 
-                    reaction_queue.put_nowait((group_id, MMG_FLIRT_CHAT_ID, media_id, None, caption, time.time()))
+                    reaction_queue.put_nowait({
+                        "type": "flirt",
+                        "target_chat_id": group_id,
+                        "storage_chat_id": MMG_FLIRT_CHAT_ID,
+                        "media_msg_id": media_id,
+                        "user_id": chosen_girl["user_id"],
+                        "first_name": chosen_girl.get("first_name", "Friend"),
+                        "queued_time": time.time()
+                    })
 
         # ---------------- 2. FLIRTS FOR BOYS ----------------
         if male_media and MMB_FLIRT_CHAT_ID != 0:
@@ -272,8 +334,6 @@ def dispatch_flirts_for_slot(slot_index):
                 if eligible_boys:
                     chosen_boy = random.choice(eligible_boys)
                     media_id = random.choice(male_media)["message_id"]
-                    mention = f"[{chosen_boy['first_name']}](tg://user?id={chosen_boy['user_id']})"
-                    caption = f"Hey {mention} ✨"
 
                     flirt_logs_col.insert_one({
                         "date": today_str,
@@ -284,7 +344,15 @@ def dispatch_flirts_for_slot(slot_index):
                         "timestamp": time.time()
                     })
 
-                    reaction_queue.put_nowait((group_id, MMB_FLIRT_CHAT_ID, media_id, None, caption, time.time()))
+                    reaction_queue.put_nowait({
+                        "type": "flirt",
+                        "target_chat_id": group_id,
+                        "storage_chat_id": MMB_FLIRT_CHAT_ID,
+                        "media_msg_id": media_id,
+                        "user_id": chosen_boy["user_id"],
+                        "first_name": chosen_boy.get("first_name", "Friend"),
+                        "queued_time": time.time()
+                    })
 
 def flirt_scheduler_loop():
     """Monitors the 5 slots and triggers dynamic dispatches."""
@@ -373,14 +441,14 @@ def run_web():
     port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port)
 
-# ---------------- BOT HANDLERS (ORDER IS CRITICAL) ----------------
+# ---------------- BOT HANDLERS ----------------
 
 # A. Base Command: /getid works everywhere
 @bot.message_handler(commands=['getid'])
 def send_id(message):
     bot.reply_to(message, f"Chat ID: {message.chat.id}")
 
-# B. Private Chat Commands: /start Gender Registration (High Priority)
+# B. Private Chat Commands: /start Gender Registration
 def get_gender_keyboard():
     keyboard = types.InlineKeyboardMarkup(row_width=2)
     keyboard.add(
@@ -503,9 +571,14 @@ def handle_public_group(message):
 
     if selected_msg_id:
         try:
-            reaction_queue.put_nowait(
-                (message.chat.id, storage_chat_id, selected_msg_id, message.message_id, None, time.time())
-            )
+            reaction_queue.put_nowait({
+                "type": "reaction",
+                "target_chat_id": message.chat.id,
+                "storage_chat_id": storage_chat_id,
+                "media_msg_id": selected_msg_id,
+                "reply_to_id": message.message_id,
+                "queued_time": time.time()
+            })
         except queue.Full:
             pass
 
