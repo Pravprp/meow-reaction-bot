@@ -32,6 +32,9 @@ except Exception:
 # Queue for outgoing messages (1 job at a time, 2-second rate-limit gap)
 reaction_queue = queue.Queue(maxsize=1000)
 
+# Names of private storage groups that should NEVER be treated as target groups
+STORAGE_GROUP_NAMES = ["mmb flirt", "mmg flirt", "mmb", "mmg", "mm memes"]
+
 # ---------------- MONGODB SETUP ----------------
 mongo_client = None
 db = None
@@ -51,8 +54,8 @@ if MONGO_URI:
 
         users_col = db["users"]                  # Gender registrations via /start
         group_members_col = db["group_members"]  # Member roster per group
-        public_groups_col = db["public_groups"]  # Target public groups
-        flirt_media_col = db["flirt_media"]      # Flirt media from source groups
+        public_groups_col = db["public_groups"]  # Target public groups (e.g. Walkie Talkies)
+        flirt_media_col = db["flirt_media"]      # Flirt media from source storage groups
         flirt_logs_col = db["flirt_logs"]        # Dispatched flirts tracker
         topics_col = db["topics"]                # Forum topic keywords for MMB/MMG
         media_col = db["media"]                  # Reaction media for MMB/MMG
@@ -71,6 +74,13 @@ if MONGO_URI:
         print(f"MongoDB Initialization Error: {e}")
 
 # ---------------- DATABASE & HELPER FUNCTIONS ----------------
+
+def is_storage_group(chat_id, title=""):
+    """Returns True if the group is one of our private media vaults by ID or Title."""
+    if chat_id in [MMB_CHAT_ID, MMG_CHAT_ID, MMB_FLIRT_CHAT_ID, MMG_FLIRT_CHAT_ID, MM_MEMES_CHAT_ID]:
+        return True
+    title_clean = (title or "").strip().lower()
+    return title_clean in STORAGE_GROUP_NAMES
 
 def is_bot_admin(chat_id):
     """Verifies that the bot is an administrator in the target group."""
@@ -94,8 +104,8 @@ def track_activity(chat, user):
     if chat.type not in ["group", "supergroup"] or user is None or user.is_bot:
         return
 
-    # Do not track private storage groups as public targets
-    if chat.id in [MMB_CHAT_ID, MMG_CHAT_ID, MMB_FLIRT_CHAT_ID, MMG_FLIRT_CHAT_ID, MM_MEMES_CHAT_ID]:
+    # Safety Lock: Never register private storage vaults as public target groups
+    if is_storage_group(chat.id, chat.title):
         return
 
     if public_groups_col is not None:
@@ -215,7 +225,7 @@ def process_queue():
                     user_id = job["user_id"]
                     first_name = job["first_name"]
                     try:
-                        # 1. Send the meme from the storage group to the target group
+                        # 1. Send the meme from the storage group into target group (e.g. Walkie Talkies)
                         sent_msg = bot.copy_message(
                             chat_id=target_chat_id,
                             from_chat_id=storage_chat_id,
@@ -223,7 +233,7 @@ def process_queue():
                         )
                         sent_msg_id = getattr(sent_msg, 'message_id', sent_msg)
 
-                        # Small 1-second interval before tagging
+                        # Small 1-second pause before replying with mention
                         time.sleep(1)
 
                         # 2. Tag the target user as a direct reply without saying "Hey"
@@ -243,7 +253,7 @@ def process_queue():
                         print(f"Flirt transfer error: {e}")
 
             reaction_queue.task_done()
-            time.sleep(2)  # 2-second buffer to protect the 0.1 CPU
+            time.sleep(2)  # 2-second rate-limit buffer to protect 0.1 CPU
 
         except Exception as e:
             print(f"Queue worker exception: {e}")
@@ -268,7 +278,7 @@ def generate_daily_schedule():
     return sorted([m1, m2, a1, e1, e2])
 
 def dispatch_flirts_for_slot(slot_index):
-    """Evaluates all public groups where bot is admin and dispatches flirts."""
+    """Evaluates genuine public groups (e.g. Walkie Talkies) and dispatches flirts."""
     if public_groups_col is None or group_members_col is None or flirt_media_col is None or flirt_logs_col is None:
         return
 
@@ -281,8 +291,13 @@ def dispatch_flirts_for_slot(slot_index):
 
     for group in public_groups:
         group_id = group["chat_id"]
+        group_title = group.get("title", "")
 
-        # Only dispatch if the bot is an Administrator in this group
+        # Safeguard: Never send flirts into storage groups
+        if is_storage_group(group_id, group_title):
+            continue
+
+        # Only dispatch if the bot is an Administrator in the target group
         if not is_bot_admin(group_id):
             continue
 
@@ -500,9 +515,10 @@ def handle_confirm(call):
 
 # C. Media Uploads inside MMG Flirt and MMB Flirt (Source Storage Groups)
 @bot.message_handler(content_types=['photo', 'animation', 'video'],
-                     func=lambda m: m.chat.id in [MMG_FLIRT_CHAT_ID, MMB_FLIRT_CHAT_ID] and m.chat.id != 0)
+                     func=lambda m: (m.chat.id in [MMG_FLIRT_CHAT_ID, MMB_FLIRT_CHAT_ID] or (m.chat.title or "").strip().lower() in ["mmg flirt", "mmb flirt"]))
 def index_flirt_media(message):
-    target_gender = "f" if message.chat.id == MMG_FLIRT_CHAT_ID else "m"
+    title_lower = (message.chat.title or "").strip().lower()
+    target_gender = "f" if (message.chat.id == MMG_FLIRT_CHAT_ID or title_lower == "mmg flirt") else "m"
     if flirt_media_col is not None:
         flirt_media_col.update_one(
             {"gender": target_gender, "message_id": message.message_id},
@@ -548,11 +564,9 @@ def index_memes(message):
             upsert=True
         )
 
-# H. Public Group Activity & Reaction Listener (Only runs on group and supergroup chats)
+# H. Public Group Activity & Reaction Listener (Only runs on genuine public chat groups)
 @bot.message_handler(content_types=['text', 'photo', 'animation', 'video', 'document', 'sticker'],
-                     func=lambda m: m.chat.type in ['group', 'supergroup'] and m.chat.id not in [
-                         MMB_CHAT_ID, MMG_CHAT_ID, MMB_FLIRT_CHAT_ID, MMG_FLIRT_CHAT_ID, MM_MEMES_CHAT_ID
-                     ])
+                     func=lambda m: m.chat.type in ['group', 'supergroup'] and not is_storage_group(m.chat.id, m.chat.title))
 def handle_public_group(message):
     # Track presence of users who speak in public groups
     track_activity(message.chat, message.from_user)
