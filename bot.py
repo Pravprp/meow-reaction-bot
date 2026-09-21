@@ -447,6 +447,36 @@ def daily_meme_pinner():
 
         time.sleep(60)
 
+# ---------------- DEPLOYMENT NOTIFICATION TASK ----------------
+
+def notify_deployment():
+    """Sends a verification message to storage groups once deployment is active."""
+    time.sleep(3)  # Brief pause to allow internet connections to stabilize
+
+    # Notify MM Memes
+    if MM_MEMES_CHAT_ID != 0:
+        try:
+            bot.send_message(MM_MEMES_CHAT_ID, "you can use this group to store the memes.")
+            print("Deployment notification sent to MM Memes.")
+        except Exception as e:
+            print(f"Failed to send deployment message to MM Memes: {e}")
+
+    # Notify MMB Flirt
+    if MMB_FLIRT_CHAT_ID != 0:
+        try:
+            bot.send_message(MMB_FLIRT_CHAT_ID, "You can use this group now to store flirt images.")
+            print("Deployment notification sent to MMB Flirt.")
+        except Exception as e:
+            print(f"Failed to send deployment message to MMB Flirt: {e}")
+
+    # Notify MMG Flirt
+    if MMG_FLIRT_CHAT_ID != 0:
+        try:
+            bot.send_message(MMG_FLIRT_CHAT_ID, "You can use this group now to store flirt images.")
+            print("Deployment notification sent to MMG Flirt.")
+        except Exception as e:
+            print(f"Failed to send deployment message to MMG Flirt: {e}")
+
 # ---------------- KEEP-ALIVE SERVER ----------------
 @app.route('/')
 def home():
@@ -602,4 +632,5 @@ if __name__ == "__main__":
     threading.Thread(target=process_queue, daemon=True).start()
     threading.Thread(target=flirt_scheduler_loop, daemon=True).start()
     threading.Thread(target=daily_meme_pinner, daemon=True).start()
+    threading.Thread(target=notify_deployment, daemon=True).start()
     bot.infinity_polling()
