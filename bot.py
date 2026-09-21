@@ -431,15 +431,6 @@ def notify_deployment():
         except Exception as e:
             print(f"Failed to send deployment message to MMG Flirt: {e}")
 
-# ---------------- KEEP-ALIVE SERVER ----------------
-@app.route('/')
-def home():
-    return "Bot running 24/7 with Multi-Group Reactions and Dynamic Flirt Dispatcher!", 200
-
-def run_web():
-    port = int(os.environ.get("PORT", 8080))
-    app.run(host="0.0.0.0", port=port)
-
 # ---------------- BOT HANDLERS ----------------
 
 # A. Base Command: /getid works everywhere
@@ -523,24 +514,32 @@ def index_memes(message):
         )
         print(f"Indexed meme ID {message.message_id} in MM Memes storage.")
 
-# E. Topic Creation in MMB or MMG (Silent indexing, zero responses)
-@bot.message_handler(content_types=['forum_topic_created'], func=lambda m: m.chat.id in [MMB_CHAT_ID, MMG_CHAT_ID] and m.chat.id != 0)
+# E. Topic Creation in MMB or MMG (Auto-reply restored)
+@bot.message_handler(content_types=['forum_topic_created'],
+                     func=lambda m: (m.chat.id in [MMB_CHAT_ID, MMG_CHAT_ID] or (m.chat.title or "").strip().lower() in ["mmb", "mmg"]) and m.chat.id != 0)
 def on_topic_created(message):
     name = message.forum_topic_created.name.strip().lower()
     save_topic(message.chat.id, message.message_thread_id, name)
-    print(f"Topic '{name}' created and indexed silently.")
+    try:
+        bot.reply_to(message, f"Topic auto-linked to keyword: '{name}'")
+    except Exception as e:
+        print(f"Error replying to topic creation: {e}")
 
-# F. Topic Renamed in MMB or MMG (Silent updating, zero responses)
-@bot.message_handler(content_types=['forum_topic_edited'], func=lambda m: m.chat.id in [MMB_CHAT_ID, MMG_CHAT_ID] and m.chat.id != 0)
+# F. Topic Renamed in MMB or MMG (Auto-reply restored)
+@bot.message_handler(content_types=['forum_topic_edited'],
+                     func=lambda m: (m.chat.id in [MMB_CHAT_ID, MMG_CHAT_ID] or (m.chat.title or "").strip().lower() in ["mmb", "mmg"]) and m.chat.id != 0)
 def on_topic_edited(message):
     if message.forum_topic_edited.name:
         new_name = message.forum_topic_edited.name.strip().lower()
         update_topic_keyword(message.chat.id, message.message_thread_id, new_name)
-        print(f"Topic updated to '{new_name}' silently.")
+        try:
+            bot.reply_to(message, f"Topic updated to keyword: '{new_name}'")
+        except Exception as e:
+            print(f"Error replying to topic rename: {e}")
 
 # G. Media Uploads inside MMB or MMG topics (Silent indexing, zero responses)
 @bot.message_handler(content_types=['text', 'photo', 'animation', 'document', 'video', 'sticker'],
-                     func=lambda m: m.chat.id in [MMB_CHAT_ID, MMG_CHAT_ID] and m.chat.id != 0)
+                     func=lambda m: (m.chat.id in [MMB_CHAT_ID, MMG_CHAT_ID] or (m.chat.title or "").strip().lower() in ["mmb", "mmg"]) and m.chat.id != 0)
 def index_media(message):
     if message.text and message.text.startswith('/'):
         return
