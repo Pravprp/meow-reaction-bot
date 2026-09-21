@@ -235,11 +235,9 @@ def dispatch_flirts_for_slot(slot_index):
             verified_girls = list(group_members_col.find({"chat_id": group_id, "gender": "f"}))
             total_girls = len(verified_girls)
 
-            # Dynamic slot mapping: 1 girl = slot 0 only; 3 girls = slots 0, 1, 2; 4 girls = slots 0, 1, 2, 3
             active_slots = min(total_girls, 5)
 
             if slot_index < active_slots:
-                # Exclude girls who already received a flirt today across ANY group
                 used_today = set(flirt_logs_col.distinct("user_id", {"date": today_str}))
                 eligible_girls = [g for g in verified_girls if g["user_id"] not in used_today]
 
@@ -249,7 +247,6 @@ def dispatch_flirts_for_slot(slot_index):
                     mention = f"[{chosen_girl['first_name']}](tg://user?id={chosen_girl['user_id']})"
                     caption = f"Hey {mention} ✨"
 
-                    # Log immediately to prevent selection in other groups
                     flirt_logs_col.insert_one({
                         "date": today_str,
                         "chat_id": group_id,
@@ -376,90 +373,14 @@ def run_web():
     port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port)
 
-# ---------------- BOT HANDLERS ----------------
+# ---------------- BOT HANDLERS (ORDER IS CRITICAL) ----------------
 
+# A. Base Command: /getid works everywhere
 @bot.message_handler(commands=['getid'])
 def send_id(message):
     bot.reply_to(message, f"Chat ID: {message.chat.id}")
 
-# 1. Media Uploads inside MMG Flirt and MMB Flirt (Source Storage Groups)
-@bot.message_handler(content_types=['photo', 'animation', 'video'],
-                     func=lambda m: m.chat.id in [MMG_FLIRT_CHAT_ID, MMB_FLIRT_CHAT_ID] and m.chat.id != 0)
-def index_flirt_media(message):
-    target_gender = "f" if message.chat.id == MMG_FLIRT_CHAT_ID else "m"
-    if flirt_media_col is not None:
-        flirt_media_col.update_one(
-            {"gender": target_gender, "message_id": message.message_id},
-            {"$set": {"gender": target_gender, "message_id": message.message_id}},
-            upsert=True
-        )
-        print(f"Indexed flirt media ID {message.message_id} for gender '{target_gender}'")
-
-# 2. Topic Creation in MMB or MMG
-@bot.message_handler(content_types=['forum_topic_created'], func=lambda m: m.chat.id in [MMB_CHAT_ID, MMG_CHAT_ID] and m.chat.id != 0)
-def on_topic_created(message):
-    name = message.forum_topic_created.name.strip().lower()
-    save_topic(message.chat.id, message.message_thread_id, name)
-    bot.reply_to(message, f"Topic auto-linked to keyword: '{name}'")
-
-# 3. Topic Renamed in MMB or MMG
-@bot.message_handler(content_types=['forum_topic_edited'], func=lambda m: m.chat.id in [MMB_CHAT_ID, MMG_CHAT_ID] and m.chat.id != 0)
-def on_topic_edited(message):
-    if message.forum_topic_edited.name:
-        new_name = message.forum_topic_edited.name.strip().lower()
-        update_topic_keyword(message.chat.id, message.message_thread_id, new_name)
-        bot.reply_to(message, f"Topic updated to keyword: '{new_name}'")
-
-# 4. Media Uploads inside MMB or MMG topics
-@bot.message_handler(content_types=['text', 'photo', 'animation', 'document', 'video', 'sticker'],
-                     func=lambda m: m.chat.id in [MMB_CHAT_ID, MMG_CHAT_ID] and m.chat.id != 0)
-def index_media(message):
-    if message.text and message.text.startswith('/'):
-        return
-    thread_id = message.message_thread_id
-    if thread_id:
-        keyword = get_keyword(message.chat.id, thread_id)
-        if keyword:
-            save_media(message.chat.id, keyword, message.message_id)
-
-# 5. MM Memes Media Storage
-@bot.message_handler(content_types=['photo', 'animation', 'video', 'document'], func=lambda m: m.chat.id == MM_MEMES_CHAT_ID and m.chat.id != 0)
-def index_memes(message):
-    if memes_col is not None:
-        memes_col.update_one(
-            {"message_id": message.message_id},
-            {"$set": {"message_id": message.message_id}},
-            upsert=True
-        )
-
-# 6. Public Group Activity & Reaction Listener
-@bot.message_handler(content_types=['text', 'photo', 'animation', 'video', 'document', 'sticker'],
-                     func=lambda m: m.chat.id not in [MMB_CHAT_ID, MMG_CHAT_ID, MMB_FLIRT_CHAT_ID, MMG_FLIRT_CHAT_ID, MM_MEMES_CHAT_ID])
-def handle_public_group(message):
-    # Track presence of users who speak in public groups
-    track_activity(message.chat, message.from_user)
-
-    # Keywords apply only to plain text non-replies
-    if message.content_type != 'text' or message.reply_to_message is not None or not message.from_user:
-        return
-
-    gender = get_user_gender(message.from_user.id)
-    if not gender:
-        return
-
-    trigger = message.text.strip().lower()
-    storage_chat_id = MMB_CHAT_ID if gender == "m" else MMG_CHAT_ID
-    selected_msg_id = get_random_media(storage_chat_id, trigger)
-
-    if selected_msg_id:
-        try:
-            reaction_queue.put_nowait(
-                (message.chat.id, storage_chat_id, selected_msg_id, message.message_id, None, time.time())
-            )
-        except queue.Full:
-            pass
-
-# 7. /start Gender Registration in Private Chat
+# B. Private Chat Commands: /start Gender Registration (High Priority)
 def get_gender_keyboard():
     keyboard = types.InlineKeyboardMarkup(row_width=2)
     keyboard.add(
@@ -468,10 +389,8 @@ def get_gender_keyboard():
     )
     return keyboard
 
-@bot.message_handler(commands=['start'])
+@bot.message_handler(commands=['start'], func=lambda m: m.chat.type == "private")
 def handle_start(message):
-    if message.chat.type != "private":
-        return
     bot.send_message(message.chat.id, "Select your gender:", reply_markup=get_gender_keyboard())
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("select_"))
@@ -510,6 +429,85 @@ def handle_confirm(call):
         bot.edit_message_text(f"Saved! You are registered as {'Male (m)' if gender == 'm' else 'Female (f)'}.", chat_id=call.message.chat.id, message_id=call.message.message_id)
     else:
         bot.edit_message_text("Database connection error. Please try again later.", chat_id=call.message.chat.id, message_id=call.message.message_id)
+
+# C. Media Uploads inside MMG Flirt and MMB Flirt (Source Storage Groups)
+@bot.message_handler(content_types=['photo', 'animation', 'video'],
+                     func=lambda m: m.chat.id in [MMG_FLIRT_CHAT_ID, MMB_FLIRT_CHAT_ID] and m.chat.id != 0)
+def index_flirt_media(message):
+    target_gender = "f" if message.chat.id == MMG_FLIRT_CHAT_ID else "m"
+    if flirt_media_col is not None:
+        flirt_media_col.update_one(
+            {"gender": target_gender, "message_id": message.message_id},
+            {"$set": {"gender": target_gender, "message_id": message.message_id}},
+            upsert=True
+        )
+        print(f"Indexed flirt media ID {message.message_id} for gender '{target_gender}'")
+
+# D. Topic Creation in MMB or MMG
+@bot.message_handler(content_types=['forum_topic_created'], func=lambda m: m.chat.id in [MMB_CHAT_ID, MMG_CHAT_ID] and m.chat.id != 0)
+def on_topic_created(message):
+    name = message.forum_topic_created.name.strip().lower()
+    save_topic(message.chat.id, message.message_thread_id, name)
+    bot.reply_to(message, f"Topic auto-linked to keyword: '{name}'")
+
+# E. Topic Renamed in MMB or MMG
+@bot.message_handler(content_types=['forum_topic_edited'], func=lambda m: m.chat.id in [MMB_CHAT_ID, MMG_CHAT_ID] and m.chat.id != 0)
+def on_topic_edited(message):
+    if message.forum_topic_edited.name:
+        new_name = message.forum_topic_edited.name.strip().lower()
+        update_topic_keyword(message.chat.id, message.message_thread_id, new_name)
+        bot.reply_to(message, f"Topic updated to keyword: '{new_name}'")
+
+# F. Media Uploads inside MMB or MMG topics
+@bot.message_handler(content_types=['text', 'photo', 'animation', 'document', 'video', 'sticker'],
+                     func=lambda m: m.chat.id in [MMB_CHAT_ID, MMG_CHAT_ID] and m.chat.id != 0)
+def index_media(message):
+    if message.text and message.text.startswith('/'):
+        return
+    thread_id = message.message_thread_id
+    if thread_id:
+        keyword = get_keyword(message.chat.id, thread_id)
+        if keyword:
+            save_media(message.chat.id, keyword, message.message_id)
+
+# G. MM Memes Media Storage
+@bot.message_handler(content_types=['photo', 'animation', 'video', 'document'], func=lambda m: m.chat.id == MM_MEMES_CHAT_ID and m.chat.id != 0)
+def index_memes(message):
+    if memes_col is not None:
+        memes_col.update_one(
+            {"message_id": message.message_id},
+            {"$set": {"message_id": message.message_id}},
+            upsert=True
+        )
+
+# H. Public Group Activity & Reaction Listener (Only runs on group and supergroup chats)
+@bot.message_handler(content_types=['text', 'photo', 'animation', 'video', 'document', 'sticker'],
+                     func=lambda m: m.chat.type in ['group', 'supergroup'] and m.chat.id not in [
+                         MMB_CHAT_ID, MMG_CHAT_ID, MMB_FLIRT_CHAT_ID, MMG_FLIRT_CHAT_ID, MM_MEMES_CHAT_ID
+                     ])
+def handle_public_group(message):
+    # Track presence of users who speak in public groups
+    track_activity(message.chat, message.from_user)
+
+    # Keywords apply only to plain text non-replies
+    if message.content_type != 'text' or message.reply_to_message is not None or not message.from_user:
+        return
+
+    gender = get_user_gender(message.from_user.id)
+    if not gender:
+        return
+
+    trigger = message.text.strip().lower()
+    storage_chat_id = MMB_CHAT_ID if gender == "m" else MMG_CHAT_ID
+    selected_msg_id = get_random_media(storage_chat_id, trigger)
+
+    if selected_msg_id:
+        try:
+            reaction_queue.put_nowait(
+                (message.chat.id, storage_chat_id, selected_msg_id, message.message_id, None, time.time())
+            )
+        except queue.Full:
+            pass
 
 # ---------------- START SERVICES ----------------
 if __name__ == "__main__":
