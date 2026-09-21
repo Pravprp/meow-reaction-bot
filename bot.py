@@ -59,7 +59,7 @@ if MONGO_URI:
         flirt_logs_col = db["flirt_logs"]        # Dispatched flirts tracker
         topics_col = db["topics"]                # Forum topic keywords for MMB/MMG
         media_col = db["media"]                  # Reaction media for MMB/MMG
-        memes_col = db["memes"]                  # Memes storage for MM Memes
+        memes_col = db["memes"]                  # Memes for MM Memes
 
         # Build indexes for rapid lookups
         users_col.create_index("user_id", unique=True)
@@ -177,19 +177,7 @@ def remove_dead_media(chat_id, msg_id):
         media_col.delete_one({"chat_id": chat_id, "message_id": msg_id})
     if flirt_media_col is not None:
         flirt_media_col.delete_one({"message_id": msg_id})
-    if memes_col is not None:
-        memes_col.delete_one({"message_id": msg_id})
     print(f"Purged deleted media ID {msg_id} from group {chat_id}")
-
-# ---------------- KEEP-ALIVE SERVER ----------------
-
-@app.route('/')
-def home():
-    return "Bot running 24/7 with Multi-Group Reactions and Dynamic Flirt Dispatcher!", 200
-
-def run_web():
-    port = int(os.environ.get("PORT", 8080))
-    app.run(host="0.0.0.0", port=port)
 
 # ---------------- QUEUE WORKER (ONE BY ONE, 2s GAP) ----------------
 
@@ -265,7 +253,7 @@ def process_queue():
                         print(f"Flirt transfer error: {e}")
 
             reaction_queue.task_done()
-            time.sleep(2)  # 2-second rate-limit buffer to protect CPU
+            time.sleep(2)  # 2-second rate-limit buffer to protect 0.1 CPU
 
         except Exception as e:
             print(f"Queue worker exception: {e}")
@@ -411,11 +399,59 @@ def flirt_scheduler_loop():
 
         time.sleep(60)
 
+# ---------------- DAILY RANDOM MORNING MEME PINNER ----------------
+
+def daily_meme_pinner():
+    """Picks and pins a random meme in MM Memes every morning at a random time."""
+    tz_ist = timezone(timedelta(hours=5, minutes=30))
+    pinned_today_date = None
+    target_hour = random.randint(7, 10)
+    target_minute = random.randint(0, 59)
+
+    while True:
+        try:
+            now = datetime.now(tz_ist)
+            today_str = now.strftime("%Y-%m-%d")
+            curr_mins = now.hour * 60 + now.minute
+            target_mins = target_hour * 60 + target_minute
+
+            if pinned_today_date != today_str:
+                if curr_mins >= target_mins:
+                    if memes_col is not None and MM_MEMES_CHAT_ID != 0:
+                        memes = list(memes_col.find())
+                        if memes:
+                            selected_meme = random.choice(memes)["message_id"]
+                            try:
+                                sent = bot.copy_message(
+                                    chat_id=MM_MEMES_CHAT_ID,
+                                    from_chat_id=MM_MEMES_CHAT_ID,
+                                    message_id=selected_meme
+                                )
+                                bot.pin_chat_message(
+                                    chat_id=MM_MEMES_CHAT_ID,
+                                    message_id=sent.message_id,
+                                    disable_notification=False
+                                )
+                                pinned_today_date = today_str
+                                target_hour = random.randint(7, 10)
+                                target_minute = random.randint(0, 59)
+                                print(f"Daily meme pinned successfully on {today_str}.")
+                            except ApiTelegramException as e:
+                                err_msg = str(e).lower()
+                                if "message to copy not found" in err_msg or "message can't be copied" in err_msg:
+                                    memes_col.delete_one({"message_id": selected_meme})
+                            except Exception as e:
+                                print(f"Failed to pin daily meme: {e}")
+        except Exception as e:
+            print(f"Meme scheduler error: {e}")
+
+        time.sleep(60)
+
 # ---------------- DEPLOYMENT NOTIFICATION TASK ----------------
 
 def notify_deployment():
-    """Sends a one-time verification message to storage groups once deployment is active."""
-    time.sleep(3)
+    """Sends a verification message to storage groups once deployment is active."""
+    time.sleep(3)  # Brief pause to allow internet connections to stabilize
 
     # Notify MM Memes
     if MM_MEMES_CHAT_ID != 0:
@@ -440,6 +476,15 @@ def notify_deployment():
             print("Deployment notification sent to MMG Flirt.")
         except Exception as e:
             print(f"Failed to send deployment message to MMG Flirt: {e}")
+
+# ---------------- KEEP-ALIVE SERVER ----------------
+@app.route('/')
+def home():
+    return "Bot running 24/7 with Multi-Group Reactions and Dynamic Flirt Dispatcher!", 200
+
+def run_web():
+    port = int(os.environ.get("PORT", 8080))
+    app.run(host="0.0.0.0", port=port)
 
 # ---------------- BOT HANDLERS ----------------
 
@@ -498,7 +543,7 @@ def handle_confirm(call):
     else:
         bot.edit_message_text("Database connection error. Please try again later.", chat_id=call.message.chat.id, message_id=call.message.message_id)
 
-# C. Media Storage: MMG Flirt and MMB Flirt (Silent indexing, zero responses)
+# C. Media Uploads inside MMG Flirt and MMB Flirt (Source Storage Groups)
 @bot.message_handler(content_types=['photo', 'animation', 'video'],
                      func=lambda m: (m.chat.id in [MMG_FLIRT_CHAT_ID, MMB_FLIRT_CHAT_ID] or (m.chat.title or "").strip().lower() in ["mmg flirt", "mmb flirt"]))
 def index_flirt_media(message):
@@ -512,44 +557,24 @@ def index_flirt_media(message):
         )
         print(f"Indexed flirt media ID {message.message_id} for gender '{target_gender}'")
 
-# D. Media Storage: MM Memes (Silent indexing, zero responses)
-@bot.message_handler(content_types=['photo', 'animation', 'video', 'document'],
-                     func=lambda m: (m.chat.id == MM_MEMES_CHAT_ID or (m.chat.title or "").strip().lower() == "mm memes") and m.chat.id != 0)
-def index_memes(message):
-    if memes_col is not None:
-        memes_col.update_one(
-            {"message_id": message.message_id},
-            {"$set": {"message_id": message.message_id}},
-            upsert=True
-        )
-        print(f"Indexed meme ID {message.message_id} in MM Memes storage.")
-
-# E. Topic Creation in MMB or MMG (Auto-reply enabled)
-@bot.message_handler(content_types=['forum_topic_created'],
-                     func=lambda m: (m.chat.id in [MMB_CHAT_ID, MMG_CHAT_ID] or (m.chat.title or "").strip().lower() in ["mmb", "mmg"]) and m.chat.id != 0)
+# D. Topic Creation in MMB or MMG
+@bot.message_handler(content_types=['forum_topic_created'], func=lambda m: m.chat.id in [MMB_CHAT_ID, MMG_CHAT_ID] and m.chat.id != 0)
 def on_topic_created(message):
     name = message.forum_topic_created.name.strip().lower()
     save_topic(message.chat.id, message.message_thread_id, name)
-    try:
-        bot.reply_to(message, f"Topic auto-linked to keyword: '{name}'")
-    except Exception as e:
-        print(f"Error replying to topic creation: {e}")
+    bot.reply_to(message, f"Topic auto-linked to keyword: '{name}'")
 
-# F. Topic Renamed in MMB or MMG (Auto-reply enabled)
-@bot.message_handler(content_types=['forum_topic_edited'],
-                     func=lambda m: (m.chat.id in [MMB_CHAT_ID, MMG_CHAT_ID] or (m.chat.title or "").strip().lower() in ["mmb", "mmg"]) and m.chat.id != 0)
+# E. Topic Renamed in MMB or MMG
+@bot.message_handler(content_types=['forum_topic_edited'], func=lambda m: m.chat.id in [MMB_CHAT_ID, MMG_CHAT_ID] and m.chat.id != 0)
 def on_topic_edited(message):
     if message.forum_topic_edited.name:
         new_name = message.forum_topic_edited.name.strip().lower()
         update_topic_keyword(message.chat.id, message.message_thread_id, new_name)
-        try:
-            bot.reply_to(message, f"Topic updated to keyword: '{new_name}'")
-        except Exception as e:
-            print(f"Error replying to topic rename: {e}")
+        bot.reply_to(message, f"Topic updated to keyword: '{new_name}'")
 
-# G. Media Uploads inside MMB or MMG topics (Silent indexing, zero responses)
+# F. Media Uploads inside MMB or MMG topics
 @bot.message_handler(content_types=['text', 'photo', 'animation', 'document', 'video', 'sticker'],
-                     func=lambda m: (m.chat.id in [MMB_CHAT_ID, MMG_CHAT_ID] or (m.chat.title or "").strip().lower() in ["mmb", "mmg"]) and m.chat.id != 0)
+                     func=lambda m: m.chat.id in [MMB_CHAT_ID, MMG_CHAT_ID] and m.chat.id != 0)
 def index_media(message):
     if message.text and message.text.startswith('/'):
         return
@@ -558,6 +583,16 @@ def index_media(message):
         keyword = get_keyword(message.chat.id, thread_id)
         if keyword:
             save_media(message.chat.id, keyword, message.message_id)
+
+# G. MM Memes Media Storage
+@bot.message_handler(content_types=['photo', 'animation', 'video', 'document'], func=lambda m: m.chat.id == MM_MEMES_CHAT_ID and m.chat.id != 0)
+def index_memes(message):
+    if memes_col is not None:
+        memes_col.update_one(
+            {"message_id": message.message_id},
+            {"$set": {"message_id": message.message_id}},
+            upsert=True
+        )
 
 # H. Public Group Activity & Reaction Listener (Only runs on genuine public chat groups)
 @bot.message_handler(content_types=['text', 'photo', 'animation', 'video', 'document', 'sticker'],
@@ -596,5 +631,6 @@ if __name__ == "__main__":
     threading.Thread(target=run_web, daemon=True).start()
     threading.Thread(target=process_queue, daemon=True).start()
     threading.Thread(target=flirt_scheduler_loop, daemon=True).start()
+    threading.Thread(target=daily_meme_pinner, daemon=True).start()
     threading.Thread(target=notify_deployment, daemon=True).start()
-    bot.infinity_polling(skip_pending=True)
+    bot.infinity_polling()
