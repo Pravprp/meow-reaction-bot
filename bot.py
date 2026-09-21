@@ -1,7 +1,9 @@
 import os
 import random
-import sqlite3
 import threading
+import time
+import queue
+from datetime import datetime, timezone, timedelta
 from flask import Flask
 from pymongo import MongoClient
 import telebot
@@ -10,240 +12,311 @@ from telebot.apihelper import ApiTelegramException
 
 # ---------------- CONFIGURATION ----------------
 TOKEN = os.environ.get("BOT_TOKEN")
-STORAGE_CHAT_ID = int(os.environ.get("STORAGE_CHAT_ID", 0))
 MONGO_URI = os.environ.get("MONGO_URI")
+
+MMB_CHAT_ID = int(os.environ.get("MMB_CHAT_ID", 0))
+MMG_CHAT_ID = int(os.environ.get("MMG_CHAT_ID", 0))
+MMB_APPROVED_CHAT_ID = int(os.environ.get("MMB_APPROVED_CHAT_ID", 0))
+MMG_APPROVED_CHAT_ID = int(os.environ.get("MMG_APPROVED_CHAT_ID", 0))
+MM_MEMES_CHAT_ID = int(os.environ.get("MM_MEMES_CHAT_ID", 0))
 
 bot = telebot.TeleBot(TOKEN)
 app = Flask(__name__)
 
+# Queue for outgoing reactions (1 job at a time, 2-second cooldown)
+reaction_queue = queue.Queue(maxsize=1000)
+
 # ---------------- MONGODB SETUP ----------------
-mongo_client = None
-users_col = None
+mongo_client = MongoClient(MONGO_URI)
+db = mongo_client["telegram_bot"]
 
-if MONGO_URI:
-    try:
-        mongo_client = MongoClient(MONGO_URI)
-        mongo_db = mongo_client["telegram_bot"]
-        users_col = mongo_db["users"]
-        print("Connected to MongoDB successfully.")
-    except Exception as e:
-        print(f"MongoDB Connection Error: {e}")
+users_col = db["users"]                  # Manual registrations (/start)
+approved_col = db["approved_users"]      # Overrides from Approved groups
+topics_col = db["topics"]                # Forum topic keywords
+media_col = db["media"]                  # Media pointers for MMB and MMG
+memes_col = db["memes"]                  # Meme IDs for MM Memes
 
-# ---------------- SQLITE FOR MEDIA ----------------
-def get_db():
-    return sqlite3.connect("bot_storage.db")
+# Ensure indexes for rapid lookups
+topics_col.create_index([("chat_id", 1), ("thread_id", 1)], unique=True)
+approved_col.create_index("user_id", unique=True)
+users_col.create_index("user_id", unique=True)
 
-def init_db():
-    with get_db() as conn:
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS topics (
-                thread_id INTEGER PRIMARY KEY,
-                keyword TEXT UNIQUE
-            )
-        """)
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS media (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                keyword TEXT,
-                message_id INTEGER
-            )
-        """)
+# ---------------- DATABASE HELPERS ----------------
 
-init_db()
+def get_effective_gender(user_id):
+    """
+    Checks approved groups first, then manual database registrations.
+    Returns 'm', 'f', or None if unverified.
+    """
+    # 1. Priority: Approved groups
+    approved_entry = approved_col.find_one({"user_id": user_id})
+    if approved_entry:
+        return approved_entry["gender"]
 
-def save_topic(thread_id, keyword):
-    with get_db() as conn:
-        conn.execute("INSERT OR REPLACE INTO topics (thread_id, keyword) VALUES (?, ?)", 
-                     (thread_id, keyword.strip().lower()))
+    # 2. Priority: Self-registered users via /start
+    registered_entry = users_col.find_one({"user_id": user_id})
+    if registered_entry:
+        return registered_entry.get("gender")
 
-def update_topic_keyword(thread_id, new_keyword):
-    new_keyword = new_keyword.strip().lower()
-    with get_db() as conn:
-        cur = conn.cursor()
-        cur.execute("SELECT keyword FROM topics WHERE thread_id = ?", (thread_id,))
-        row = cur.fetchone()
-        if row:
-            old_keyword = row[0]
-            conn.execute("UPDATE topics SET keyword = ? WHERE thread_id = ?", (new_keyword, thread_id))
-            conn.execute("UPDATE media SET keyword = ? WHERE keyword = ?", (new_keyword, old_keyword))
-        else:
-            conn.execute("INSERT OR REPLACE INTO topics (thread_id, keyword) VALUES (?, ?)", (thread_id, new_keyword))
+    return None
 
-def get_keyword(thread_id):
-    with get_db() as conn:
-        cur = conn.cursor()
-        cur.execute("SELECT keyword FROM topics WHERE thread_id = ?", (thread_id,))
-        row = cur.fetchone()
-        return row[0] if row else None
+def save_topic(chat_id, thread_id, keyword):
+    keyword_clean = keyword.strip().lower()
+    topics_col.update_one(
+        {"chat_id": chat_id, "thread_id": thread_id},
+        {"$set": {"keyword": keyword_clean}},
+        upsert=True
+    )
 
-def save_media(keyword, message_id):
-    with get_db() as conn:
-        conn.execute("INSERT INTO media (keyword, message_id) VALUES (?, ?)", 
-                     (keyword.strip().lower(), message_id))
+def update_topic_keyword(chat_id, thread_id, new_keyword):
+    new_keyword_clean = new_keyword.strip().lower()
+    old_topic = topics_col.find_one({"chat_id": chat_id, "thread_id": thread_id})
+    if old_topic:
+        old_keyword = old_topic.get("keyword")
+        topics_col.update_one({"chat_id": chat_id, "thread_id": thread_id}, {"$set": {"keyword": new_keyword_clean}})
+        media_col.update_many({"chat_id": chat_id, "keyword": old_keyword}, {"$set": {"keyword": new_keyword_clean}})
+    else:
+        save_topic(chat_id, thread_id, new_keyword_clean)
 
-def get_random_media(keyword):
-    with get_db() as conn:
-        cur = conn.cursor()
-        cur.execute("SELECT message_id FROM media WHERE keyword = ?", (keyword.strip().lower(),))
-        rows = cur.fetchall()
-        return random.choice(rows)[0] if rows else None
+def get_keyword(chat_id, thread_id):
+    doc = topics_col.find_one({"chat_id": chat_id, "thread_id": thread_id})
+    return doc["keyword"] if doc else None
 
-def remove_dead_media(msg_id, keyword):
-    with get_db() as conn:
-        conn.execute("DELETE FROM media WHERE message_id = ?", (msg_id,))
-        cur = conn.cursor()
-        cur.execute("SELECT COUNT(*) FROM media WHERE keyword = ?", (keyword,))
-        if cur.fetchone()[0] == 0:
-            conn.execute("DELETE FROM topics WHERE keyword = ?", (keyword,))
+def save_media(chat_id, keyword, message_id):
+    media_col.insert_one({
+        "chat_id": chat_id,
+        "keyword": keyword.strip().lower(),
+        "message_id": message_id
+    })
+
+def get_random_media(chat_id, keyword):
+    matches = list(media_col.find({"chat_id": chat_id, "keyword": keyword.strip().lower()}))
+    if matches:
+        return random.choice(matches)["message_id"]
+    return None
+
+def remove_dead_media(chat_id, msg_id, keyword):
+    media_col.delete_one({"chat_id": chat_id, "message_id": msg_id})
+    if media_col.count_documents({"chat_id": chat_id, "keyword": keyword}) == 0:
+        topics_col.delete_many({"chat_id": chat_id, "keyword": keyword})
+
+# ---------------- QUEUE WORKER (ONE BY ONE, 2s GAP) ----------------
+
+def process_queue():
+    while True:
+        try:
+            job = reaction_queue.get()
+            target_chat_id, storage_chat_id, media_msg_id, reply_to_id, keyword, queued_time = job
+
+            # Only send if the request waited less than 45 seconds
+            if time.time() - queued_time <= 45:
+                try:
+                    bot.copy_message(
+                        chat_id=target_chat_id,
+                        from_chat_id=storage_chat_id,
+                        message_id=media_msg_id,
+                        reply_to_message_id=reply_to_id
+                    )
+                except ApiTelegramException as e:
+                    err_msg = str(e).lower()
+                    if "message to copy not found" in err_msg or "not found" in err_msg:
+                        remove_dead_media(storage_chat_id, media_msg_id, keyword)
+                except Exception as e:
+                    print(f"Error copying media: {e}")
+
+            reaction_queue.task_done()
+            time.sleep(2)  # 2-second rate limit buffer
+
+        except Exception as e:
+            print(f"Queue worker exception: {e}")
+            time.sleep(1)
+
+# ---------------- DAILY RANDOM MORNING MEME PINNER ----------------
+
+def daily_meme_pinner():
+    """Selects and pins a random meme once every morning at a randomized time."""
+    tz_ist = timezone(timedelta(hours=5, minutes=30))
+    pinned_today_date = None
+    target_hour = random.randint(7, 10)
+    target_minute = random.randint(0, 59)
+
+    while True:
+        try:
+            now = datetime.now(tz_ist)
+            today_str = now.strftime("%Y-%m-%d")
+
+            # Reset random target time on a new day
+            if pinned_today_date != today_str:
+                if now.hour >= target_hour and now.minute >= target_minute:
+                    memes = list(memes_col.find())
+                    if memes and MM_MEMES_CHAT_ID != 0:
+                        selected_meme = random.choice(memes)["message_id"]
+                        try:
+                            # Send a fresh copy of the meme into the group and pin it
+                            sent = bot.copy_message(
+                                chat_id=MM_MEMES_CHAT_ID,
+                                from_chat_id=MM_MEMES_CHAT_ID,
+                                message_id=selected_meme
+                            )
+                            bot.pin_chat_message(
+                                chat_id=MM_MEMES_CHAT_ID,
+                                message_id=sent.message_id,
+                                disable_notification=False
+                            )
+                            pinned_today_date = today_str
+                            # Pick new random target time for tomorrow
+                            target_hour = random.randint(7, 10)
+                            target_minute = random.randint(0, 59)
+                        except Exception as e:
+                            print(f"Failed to pin daily meme: {e}")
+        except Exception as e:
+            print(f"Meme scheduler error: {e}")
+
+        time.sleep(60)
 
 # ---------------- KEEP-ALIVE SERVER ----------------
 @app.route('/')
 def home():
-    return "Bot is running 24/7!", 200
+    return "Bot running with Multi-Group Gender Routing!", 200
 
 def run_web():
     port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port)
 
-# ---------------- START COMMAND & GENDER SELECTION ----------------
+# ---------------- BOT HANDLERS ----------------
 
+@bot.message_handler(commands=['getid'])
+def send_id(message):
+    bot.reply_to(message, f"Chat ID: {message.chat.id}")
+
+# 1. Ingestion: "MM B Approved" and "MM G Approved" groups
+@bot.message_handler(content_types=['text'], func=lambda m: m.chat.id in [MMB_APPROVED_CHAT_ID, MMG_APPROVED_CHAT_ID])
+def handle_approved_ids(message):
+    gender = "m" if message.chat.id == MMB_APPROVED_CHAT_ID else "f"
+    lines = message.text.strip().splitlines()
+    added_count = 0
+
+    for line in lines:
+        cleaned = line.strip().replace("@", "")
+        if cleaned.isdigit():
+            uid = int(cleaned)
+            approved_col.update_one(
+                {"user_id": uid},
+                {"$set": {"user_id": uid, "gender": gender}},
+                upsert=True
+            )
+            added_count += 1
+
+    if added_count > 0:
+        bot.reply_to(message, f"Registered {added_count} user(s) as {'Boy (m)' if gender == 'm' else 'Girl (f)'}.")
+
+# 2. Ingestion: "MM Memes" media storage
+@bot.message_handler(content_types=['photo', 'animation', 'video', 'document'], func=lambda m: m.chat.id == MM_MEMES_CHAT_ID)
+def index_memes(message):
+    memes_col.update_one(
+        {"message_id": message.message_id},
+        {"$set": {"message_id": message.message_id}},
+        upsert=True
+    )
+
+# 3. Topic Creation in MMB or MMG
+@bot.message_handler(content_types=['forum_topic_created'], func=lambda m: m.chat.id in [MMB_CHAT_ID, MMG_CHAT_ID])
+def on_topic_created(message):
+    name = message.forum_topic_created.name.strip().lower()
+    save_topic(message.chat.id, message.message_thread_id, name)
+    bot.reply_to(message, f"Topic auto-linked to keyword: '{name}'")
+
+# 4. Topic Renamed/Edited in MMB or MMG
+@bot.message_handler(content_types=['forum_topic_edited'], func=lambda m: m.chat.id in [MMB_CHAT_ID, MMG_CHAT_ID])
+def on_topic_edited(message):
+    if message.forum_topic_edited.name:
+        new_name = message.forum_topic_edited.name.strip().lower()
+        update_topic_keyword(message.chat.id, message.message_thread_id, new_name)
+        bot.reply_to(message, f"Topic updated to keyword: '{new_name}'")
+
+# 5. Media Uploads inside MMB or MMG topics
+@bot.message_handler(content_types=['text', 'photo', 'animation', 'document', 'video', 'sticker'],
+                     func=lambda m: m.chat.id in [MMB_CHAT_ID, MMG_CHAT_ID])
+def index_media(message):
+    if message.text and message.text.startswith('/'):
+        return
+    thread_id = message.message_thread_id
+    if thread_id:
+        keyword = get_keyword(message.chat.id, thread_id)
+        if keyword:
+            save_media(message.chat.id, keyword, message.message_id)
+
+# 6. User Verification & Gender-Based Reaction Dispatcher
+@bot.message_handler(content_types=['text'], func=lambda m: m.chat.id not in [
+    MMB_CHAT_ID, MMG_CHAT_ID, MMB_APPROVED_CHAT_ID, MMG_APPROVED_CHAT_ID, MM_MEMES_CHAT_ID
+])
+def handle_group_trigger(message):
+    # Ignore replies
+    if message.reply_to_message is not None:
+        return
+
+    user_id = message.from_user.id
+    gender = get_effective_gender(user_id)
+
+    # If user has no verified gender in approved groups or DB, DO NOT RESPOND
+    if not gender:
+        return
+
+    trigger = message.text.strip().lower()
+    storage_chat_id = MMB_CHAT_ID if gender == "m" else MMG_CHAT_ID
+
+    selected_msg_id = get_random_media(storage_chat_id, trigger)
+
+    if selected_msg_id:
+        try:
+            reaction_queue.put_nowait(
+                (message.chat.id, storage_chat_id, selected_msg_id, message.message_id, trigger, time.time())
+            )
+        except queue.Full:
+            pass
+
+# 7. Start Registration Fallback (For 1-on-1 Chats)
 def get_gender_keyboard():
     keyboard = types.InlineKeyboardMarkup(row_width=2)
-    btn_male = types.InlineKeyboardButton("👨 Male", callback_data="select_m")
-    btn_female = types.InlineKeyboardButton("👩 Female", callback_data="select_f")
+    btn_male = types.InlineKeyboardButton("Male", callback_data="select_m")
+    btn_female = types.InlineKeyboardButton("Female", callback_data="select_f")
     keyboard.add(btn_male, btn_female)
     return keyboard
 
 @bot.message_handler(commands=['start'])
 def handle_start(message):
     if message.chat.type != "private":
-        bot.reply_to(message, "Please use /start in a private chat with me.")
         return
-
-    text = "Welcome! Please select your gender to continue:"
-    bot.send_message(message.chat.id, text, reply_markup=get_gender_keyboard())
+    bot.send_message(message.chat.id, "Select your gender:", reply_markup=get_gender_keyboard())
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("select_"))
 def handle_gender_selection(call):
-    selected = call.data.split("_")[1] # 'm' or 'f'
-    gender_name = "Male (m)" if selected == "m" else "Female (f)"
-
+    selected = call.data.split("_")[1]
+    name = "Male (m)" if selected == "m" else "Female (f)"
     keyboard = types.InlineKeyboardMarkup(row_width=2)
-    confirm_btn = types.InlineKeyboardButton("✅ Confirm", callback_data=f"confirm_{selected}")
-    change_btn = types.InlineKeyboardButton("🔄 Change", callback_data="change_gender")
-    keyboard.add(confirm_btn, change_btn)
-
-    text = f"You selected: {gender_name}\n\nClick 'Confirm' to save your details."
-    bot.edit_message_text(text, chat_id=call.message.chat.id, message_id=call.message.message_id, reply_markup=keyboard)
+    keyboard.add(
+        types.InlineKeyboardButton("Confirm", callback_data=f"confirm_{selected}"),
+        types.InlineKeyboardButton("Change", callback_data="change_gender")
+    )
+    bot.edit_message_text(f"Selected: {name}\nClick Confirm to save.", chat_id=call.message.chat.id, message_id=call.message.message_id, reply_markup=keyboard)
 
 @bot.callback_query_handler(func=lambda call: call.data == "change_gender")
-def handle_change_gender(call):
-    text = "Please select your gender:"
-    bot.edit_message_text(text, chat_id=call.message.chat.id, message_id=call.message.message_id, reply_markup=get_gender_keyboard())
+def handle_change(call):
+    bot.edit_message_text("Select your gender:", chat_id=call.message.chat.id, message_id=call.message.message_id, reply_markup=get_gender_keyboard())
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("confirm_"))
-def handle_confirmation(call):
-    gender = call.data.split("_")[1] # 'm' or 'f'
-    user_id = call.from_user.id
-    gender_full = "Male" if gender == "m" else "Female"
+def handle_confirm(call):
+    gender = call.data.split("_")[1]
+    users_col.update_one(
+        {"user_id": call.from_user.id},
+        {"$set": {"user_id": call.from_user.id, "gender": gender}},
+        upsert=True
+    )
+    bot.edit_message_text(f"Saved! You are registered as {'Male (m)' if gender == 'm' else 'Female (f)'}.", chat_id=call.message.chat.id, message_id=call.message.message_id)
 
-    if users_col is not None:
-        try:
-            users_col.update_one(
-                {"user_id": user_id},
-                {
-                    "$set": {
-                        "user_id": user_id,
-                        "gender": gender
-                    }
-                },
-                upsert=True
-            )
-            text = f"Registration successful!\n\nUser ID: {user_id}\nGender: {gender_full} ({gender})\n\nYour details are saved in the database."
-        except Exception as e:
-            text = "An error occurred while saving your data. Please try again later."
-            print(f"MongoDB insert error: {e}")
-    else:
-        text = "Database connection is not configured yet. Please contact the administrator."
-
-    bot.edit_message_text(text, chat_id=call.message.chat.id, message_id=call.message.message_id)
-
-# ---------------- STORAGE & TOPIC HANDLERS ----------------
-
-@bot.message_handler(commands=['getid'])
-def send_id(message):
-    bot.reply_to(message, f"Chat ID: {message.chat.id}")
-
-@bot.message_handler(content_types=['forum_topic_created'], func=lambda m: m.chat.id == STORAGE_CHAT_ID)
-def on_topic_created(message):
-    name = message.forum_topic_created.name.strip().lower()
-    thread_id = message.message_thread_id
-    save_topic(thread_id, name)
-    bot.reply_to(message, f"Topic auto-linked to keyword: '{name}'")
-
-@bot.message_handler(content_types=['forum_topic_edited'], func=lambda m: m.chat.id == STORAGE_CHAT_ID)
-def on_topic_edited(message):
-    thread_id = message.message_thread_id
-    if message.forum_topic_edited.name:
-        new_name = message.forum_topic_edited.name.strip().lower()
-        update_topic_keyword(thread_id, new_name)
-        bot.reply_to(message, f"Topic updated to keyword: '{new_name}'")
-
-@bot.message_handler(commands=['setword'], func=lambda m: m.chat.id == STORAGE_CHAT_ID)
-def manual_set_word(message):
-    parts = message.text.split(maxsplit=1)
-    if len(parts) > 1 and message.message_thread_id:
-        word = parts[1].strip().lower()
-        save_topic(message.message_thread_id, word)
-        bot.reply_to(message, f"Linked this topic to word: '{word}'")
-    else:
-        bot.reply_to(message, "Usage: Send '/setword <word>' inside the target topic.")
-
-@bot.message_handler(commands=['delword'], func=lambda m: m.chat.id == STORAGE_CHAT_ID)
-def manual_del_word(message):
-    parts = message.text.split(maxsplit=1)
-    if len(parts) > 1:
-        word = parts[1].strip().lower()
-        with get_db() as conn:
-            conn.execute("DELETE FROM topics WHERE keyword = ?", (word,))
-            conn.execute("DELETE FROM media WHERE keyword = ?", (word,))
-        bot.reply_to(message, f"Deleted keyword and all saved media for: '{word}'")
-    else:
-        bot.reply_to(message, "Usage: Send '/delword <word>' to delete it.")
-
-@bot.message_handler(content_types=['text', 'photo', 'animation', 'document', 'video', 'sticker'], 
-                     func=lambda m: m.chat.id == STORAGE_CHAT_ID)
-def index_media(message):
-    if message.text and message.text.startswith('/'):
-        return
-    thread_id = message.message_thread_id
-    if thread_id:
-        keyword = get_keyword(thread_id)
-        if keyword:
-            save_media(keyword, message.message_id)
-
-@bot.message_handler(content_types=['text'], func=lambda m: m.chat.id != STORAGE_CHAT_ID)
-def handle_group_trigger(message):
-    if message.reply_to_message is not None:
-        return
-
-    trigger = message.text.strip().lower()
-    selected_msg_id = get_random_media(trigger)
-
-    if selected_msg_id:
-        try:
-            bot.copy_message(
-                chat_id=message.chat.id,
-                from_chat_id=STORAGE_CHAT_ID,
-                message_id=selected_msg_id,
-                reply_to_message_id=message.message_id
-            )
-        except ApiTelegramException as e:
-            error_text = str(e).lower()
-            if "message to copy not found" in error_text or "not found" in error_text:
-                remove_dead_media(selected_msg_id, trigger)
-
-# ---------------- START ----------------
+# ---------------- START SERVICES ----------------
 if __name__ == "__main__":
     threading.Thread(target=run_web, daemon=True).start()
+    threading.Thread(target=process_queue, daemon=True).start()
+    threading.Thread(target=daily_meme_pinner, daemon=True).start()
     bot.infinity_polling()
