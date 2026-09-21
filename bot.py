@@ -16,21 +16,24 @@ MONGO_URI = os.environ.get("MONGO_URI")
 
 MMB_CHAT_ID = int(os.environ.get("MMB_CHAT_ID") or 0)
 MMG_CHAT_ID = int(os.environ.get("MMG_CHAT_ID") or 0)
-MMB_APPROVED_CHAT_ID = int(os.environ.get("MMB_APPROVED_CHAT_ID") or 0)
-MMG_APPROVED_CHAT_ID = int(os.environ.get("MMG_APPROVED_CHAT_ID") or 0)
+MMB_FLIRT_CHAT_ID = int(os.environ.get("MMB_FLIRT_CHAT_ID") or 0)
+MMG_FLIRT_CHAT_ID = int(os.environ.get("MMG_FLIRT_CHAT_ID") or 0)
 MM_MEMES_CHAT_ID = int(os.environ.get("MM_MEMES_CHAT_ID") or 0)
 
 bot = telebot.TeleBot(TOKEN)
 app = Flask(__name__)
 
-# Queue for outgoing reactions (1 job at a time, 2-second cooldown)
+# Queue for outgoing messages (1 job at a time, 2-second rate-limit gap)
 reaction_queue = queue.Queue(maxsize=1000)
 
 # ---------------- MONGODB SETUP ----------------
 mongo_client = None
 db = None
 users_col = None
-approved_col = None
+group_members_col = None
+public_groups_col = None
+flirt_media_col = None
+flirt_logs_col = None
 topics_col = None
 media_col = None
 memes_col = None
@@ -40,61 +43,87 @@ if MONGO_URI:
         mongo_client = MongoClient(MONGO_URI)
         db = mongo_client["telegram_bot"]
 
-        users_col = db["users"]                  # Manual registrations (/start)
-        approved_col = db["approved_users"]      # Overrides from Approved groups
-        topics_col = db["topics"]                # Forum topic keywords
-        media_col = db["media"]                  # Media pointers for MMB and MMG
-        memes_col = db["memes"]                  # Meme IDs for MM Memes
+        users_col = db["users"]                  # Gender registrations via /start
+        group_members_col = db["group_members"]  # Member roster per group
+        public_groups_col = db["public_groups"]  # Target public groups
+        flirt_media_col = db["flirt_media"]      # Flirt media from source groups
+        flirt_logs_col = db["flirt_logs"]        # Dispatched flirts tracker
+        topics_col = db["topics"]                # Forum topic keywords for MMB/MMG
+        media_col = db["media"]                  # Reaction media for MMB/MMG
+        memes_col = db["memes"]                  # Memes for MM Memes
 
-        # Ensure indexes for rapid lookups
-        topics_col.create_index([("chat_id", 1), ("thread_id", 1)], unique=True)
-        approved_col.create_index("user_id", unique=True)
+        # Build indexes for rapid lookups
         users_col.create_index("user_id", unique=True)
+        public_groups_col.create_index("chat_id", unique=True)
+        group_members_col.create_index([("chat_id", 1), ("user_id", 1)], unique=True)
+        flirt_media_col.create_index([("gender", 1), ("message_id", 1)], unique=True)
+        flirt_logs_col.create_index([("date", 1), ("user_id", 1)])
+        topics_col.create_index([("chat_id", 1), ("thread_id", 1)], unique=True)
+
         print("Connected to MongoDB successfully.")
     except Exception as e:
         print(f"MongoDB Initialization Error: {e}")
 
 # ---------------- DATABASE HELPERS ----------------
 
-def get_effective_gender(user_id):
-    """
-    Checks approved groups first, then manual database registrations.
-    Returns 'm', 'f', or None if unverified.
-    """
-    if approved_col is None or users_col is None:
+def get_user_gender(user_id):
+    """Retrieves gender registered via /start ('m' or 'f')."""
+    if users_col is None:
         return None
+    user_doc = users_col.find_one({"user_id": user_id})
+    return user_doc.get("gender") if user_doc else None
 
-    approved_entry = approved_col.find_one({"user_id": user_id})
-    if approved_entry:
-        return approved_entry.get("gender")
+def track_activity(chat, user):
+    """Indexes target groups and members who speak in them."""
+    if chat.type not in ["group", "supergroup"] or user is None or user.is_bot:
+        return
 
-    registered_entry = users_col.find_one({"user_id": user_id})
-    if registered_entry:
-        return registered_entry.get("gender")
+    # Do not track private storage groups as public targets
+    if chat.id in [MMB_CHAT_ID, MMG_CHAT_ID, MMB_FLIRT_CHAT_ID, MMG_FLIRT_CHAT_ID, MM_MEMES_CHAT_ID]:
+        return
 
-    return None
+    if public_groups_col is not None:
+        public_groups_col.update_one(
+            {"chat_id": chat.id},
+            {"$set": {"chat_id": chat.id, "title": chat.title or "", "last_active": time.time()}},
+            upsert=True
+        )
+
+    if group_members_col is not None:
+        gender = get_user_gender(user.id)
+        group_members_col.update_one(
+            {"chat_id": chat.id, "user_id": user.id},
+            {
+                "$set": {
+                    "first_name": user.first_name or "Friend",
+                    "username": user.username or "",
+                    "gender": gender,
+                    "last_active": time.time()
+                }
+            },
+            upsert=True
+        )
 
 def save_topic(chat_id, thread_id, keyword):
     if topics_col is None:
         return
-    keyword_clean = keyword.strip().lower()
     topics_col.update_one(
         {"chat_id": chat_id, "thread_id": thread_id},
-        {"$set": {"keyword": keyword_clean}},
+        {"$set": {"keyword": keyword.strip().lower()}},
         upsert=True
     )
 
 def update_topic_keyword(chat_id, thread_id, new_keyword):
     if topics_col is None or media_col is None:
         return
-    new_keyword_clean = new_keyword.strip().lower()
+    new_kw = new_keyword.strip().lower()
     old_topic = topics_col.find_one({"chat_id": chat_id, "thread_id": thread_id})
     if old_topic:
-        old_keyword = old_topic.get("keyword")
-        topics_col.update_one({"chat_id": chat_id, "thread_id": thread_id}, {"$set": {"keyword": new_keyword_clean}})
-        media_col.update_many({"chat_id": chat_id, "keyword": old_keyword}, {"$set": {"keyword": new_keyword_clean}})
+        old_kw = old_topic.get("keyword")
+        topics_col.update_one({"chat_id": chat_id, "thread_id": thread_id}, {"$set": {"keyword": new_kw}})
+        media_col.update_many({"chat_id": chat_id, "keyword": old_kw}, {"$set": {"keyword": new_kw}})
     else:
-        save_topic(chat_id, thread_id, new_keyword_clean)
+        save_topic(chat_id, thread_id, new_kw)
 
 def get_keyword(chat_id, thread_id):
     if topics_col is None:
@@ -115,15 +144,14 @@ def get_random_media(chat_id, keyword):
     if media_col is None:
         return None
     matches = list(media_col.find({"chat_id": chat_id, "keyword": keyword.strip().lower()}))
-    if matches:
-        return random.choice(matches)["message_id"]
-    return None
+    return random.choice(matches)["message_id"] if matches else None
 
 def remove_dead_media(chat_id, msg_id):
-    """Removes deleted media message pointer from MongoDB without wiping the topic mapping."""
     if media_col is not None:
         media_col.delete_one({"chat_id": chat_id, "message_id": msg_id})
-        print(f"Purged deleted media ID {msg_id} from group {chat_id}")
+    if flirt_media_col is not None:
+        flirt_media_col.delete_one({"message_id": msg_id})
+    print(f"Purged deleted media ID {msg_id} from group {chat_id}")
 
 # ---------------- QUEUE WORKER (ONE BY ONE, 2s GAP) ----------------
 
@@ -131,50 +159,170 @@ def process_queue():
     while True:
         try:
             job = reaction_queue.get()
-            target_chat_id, storage_chat_id, media_msg_id, reply_to_id, keyword, queued_time = job
+            target_chat_id, storage_chat_id, media_msg_id, reply_to_id, caption_text, queued_time = job
 
-            # Only process if queued within the last 45 seconds
+            # Drop stale triggers older than 45 seconds
             if time.time() - queued_time <= 45:
                 try:
                     bot.copy_message(
                         chat_id=target_chat_id,
                         from_chat_id=storage_chat_id,
                         message_id=media_msg_id,
-                        reply_to_message_id=reply_to_id
+                        reply_to_message_id=reply_to_id,
+                        caption=caption_text,
+                        parse_mode="Markdown" if caption_text else None
                     )
                 except ApiTelegramException as e:
                     err_msg = str(e).lower()
-
-                    # Case A: The user deleted their message in the group before bot replied
                     if "replied message not found" in err_msg or "reply" in err_msg:
                         try:
-                            # Send without replying to the deleted message
                             bot.copy_message(
                                 chat_id=target_chat_id,
                                 from_chat_id=storage_chat_id,
-                                message_id=media_msg_id
+                                message_id=media_msg_id,
+                                caption=caption_text,
+                                parse_mode="Markdown" if caption_text else None
                             )
                         except Exception:
                             pass
-
-                    # Case B: The original storage media was deleted in MMB or MMG
                     elif "message to copy not found" in err_msg or "message can't be copied" in err_msg:
                         remove_dead_media(storage_chat_id, media_msg_id)
-
                 except Exception as e:
-                    print(f"Error copying media: {e}")
+                    print(f"Queue worker transfer error: {e}")
 
             reaction_queue.task_done()
-            time.sleep(2)  # 2-second cooldown
+            time.sleep(2)  # 2-second rate-limit buffer to protect 0.1 CPU
 
         except Exception as e:
             print(f"Queue worker exception: {e}")
             time.sleep(1)
 
+# ---------------- DYNAMIC DAILY FLIRT ENGINE ----------------
+
+def generate_daily_schedule():
+    """
+    Generates 5 distinct time slots across the day (minutes from midnight IST):
+    Slot 0: Morning 1 (08:30 - 09:55)
+    Slot 1: Morning 2 (10:05 - 11:30)
+    Slot 2: Afternoon (13:30 - 15:30)
+    Slot 3: Evening 1 (18:30 - 19:55)
+    Slot 4: Evening 2 (20:05 - 21:30)
+    """
+    m1 = random.randint(510, 595)
+    m2 = random.randint(605, 690)
+    a1 = random.randint(810, 930)
+    e1 = random.randint(1110, 1195)
+    e2 = random.randint(1205, 1290)
+    return sorted([m1, m2, a1, e1, e2])
+
+def dispatch_flirts_for_slot(slot_index):
+    """Evaluates all public groups and dispatches flirts dynamically based on user count."""
+    if public_groups_col is None or group_members_col is None or flirt_media_col is None or flirt_logs_col is None:
+        return
+
+    tz_ist = timezone(timedelta(hours=5, minutes=30))
+    today_str = datetime.now(tz_ist).strftime("%Y-%m-%d")
+
+    public_groups = list(public_groups_col.find())
+    female_media = list(flirt_media_col.find({"gender": "f"}))
+    male_media = list(flirt_media_col.find({"gender": "m"}))
+
+    for group in public_groups:
+        group_id = group["chat_id"]
+
+        # ---------------- 1. FLIRTS FOR GIRLS ----------------
+        if female_media and MMG_FLIRT_CHAT_ID != 0:
+            verified_girls = list(group_members_col.find({"chat_id": group_id, "gender": "f"}))
+            total_girls = len(verified_girls)
+
+            # Dynamic slot mapping: 1 girl = slot 0 only; 3 girls = slots 0, 1, 2; 4 girls = slots 0, 1, 2, 3
+            active_slots = min(total_girls, 5)
+
+            if slot_index < active_slots:
+                # Exclude girls who already received a flirt today across ANY group
+                used_today = set(flirt_logs_col.distinct("user_id", {"date": today_str}))
+                eligible_girls = [g for g in verified_girls if g["user_id"] not in used_today]
+
+                if eligible_girls:
+                    chosen_girl = random.choice(eligible_girls)
+                    media_id = random.choice(female_media)["message_id"]
+                    mention = f"[{chosen_girl['first_name']}](tg://user?id={chosen_girl['user_id']})"
+                    caption = f"Hey {mention} ✨"
+
+                    # Log immediately to prevent selection in other groups
+                    flirt_logs_col.insert_one({
+                        "date": today_str,
+                        "chat_id": group_id,
+                        "user_id": chosen_girl["user_id"],
+                        "gender": "f",
+                        "slot": slot_index,
+                        "timestamp": time.time()
+                    })
+
+                    reaction_queue.put_nowait((group_id, MMG_FLIRT_CHAT_ID, media_id, None, caption, time.time()))
+
+        # ---------------- 2. FLIRTS FOR BOYS ----------------
+        if male_media and MMB_FLIRT_CHAT_ID != 0:
+            verified_boys = list(group_members_col.find({"chat_id": group_id, "gender": "m"}))
+            total_boys = len(verified_boys)
+
+            active_slots = min(total_boys, 5)
+
+            if slot_index < active_slots:
+                used_today = set(flirt_logs_col.distinct("user_id", {"date": today_str}))
+                eligible_boys = [b for b in verified_boys if b["user_id"] not in used_today]
+
+                if eligible_boys:
+                    chosen_boy = random.choice(eligible_boys)
+                    media_id = random.choice(male_media)["message_id"]
+                    mention = f"[{chosen_boy['first_name']}](tg://user?id={chosen_boy['user_id']})"
+                    caption = f"Hey {mention} ✨"
+
+                    flirt_logs_col.insert_one({
+                        "date": today_str,
+                        "chat_id": group_id,
+                        "user_id": chosen_boy["user_id"],
+                        "gender": "m",
+                        "slot": slot_index,
+                        "timestamp": time.time()
+                    })
+
+                    reaction_queue.put_nowait((group_id, MMB_FLIRT_CHAT_ID, media_id, None, caption, time.time()))
+
+def flirt_scheduler_loop():
+    """Monitors the 5 slots and triggers dynamic dispatches."""
+    tz_ist = timezone(timedelta(hours=5, minutes=30))
+    current_day = None
+    daily_schedule = []
+    executed_slots = set()
+
+    while True:
+        try:
+            now = datetime.now(tz_ist)
+            today_str = now.strftime("%Y-%m-%d")
+            total_minutes = now.hour * 60 + now.minute
+
+            if current_day != today_str:
+                current_day = today_str
+                daily_schedule = generate_daily_schedule()
+                executed_slots.clear()
+                print(f"Generated new flirt schedule for {today_str}: {daily_schedule}")
+
+            for idx, slot_minute in enumerate(daily_schedule):
+                if total_minutes >= slot_minute and idx not in executed_slots:
+                    executed_slots.add(idx)
+                    print(f"Executing flirt slot {idx + 1}/5 at minute {total_minutes} IST")
+                    dispatch_flirts_for_slot(idx)
+
+        except Exception as e:
+            print(f"Flirt scheduler exception: {e}")
+
+        time.sleep(60)
+
 # ---------------- DAILY RANDOM MORNING MEME PINNER ----------------
 
 def daily_meme_pinner():
-    """Selects and pins a random meme once every morning at a randomized time."""
+    """Picks and pins a random meme in MM Memes every morning at a random time."""
     tz_ist = timezone(timedelta(hours=5, minutes=30))
     pinned_today_date = None
     target_hour = random.randint(7, 10)
@@ -184,13 +332,11 @@ def daily_meme_pinner():
         try:
             now = datetime.now(tz_ist)
             today_str = now.strftime("%Y-%m-%d")
+            curr_mins = now.hour * 60 + now.minute
+            target_mins = target_hour * 60 + target_minute
 
-            current_total_minutes = now.hour * 60 + now.minute
-            target_total_minutes = target_hour * 60 + target_minute
-
-            # Fire once per calendar day when current time reaches or exceeds the target time
             if pinned_today_date != today_str:
-                if current_total_minutes >= target_total_minutes:
+                if curr_mins >= target_mins:
                     if memes_col is not None and MM_MEMES_CHAT_ID != 0:
                         memes = list(memes_col.find())
                         if memes:
@@ -207,8 +353,6 @@ def daily_meme_pinner():
                                     disable_notification=False
                                 )
                                 pinned_today_date = today_str
-
-                                # Generate new target morning time for tomorrow
                                 target_hour = random.randint(7, 10)
                                 target_minute = random.randint(0, 59)
                                 print(f"Daily meme pinned successfully on {today_str}.")
@@ -226,7 +370,7 @@ def daily_meme_pinner():
 # ---------------- KEEP-ALIVE SERVER ----------------
 @app.route('/')
 def home():
-    return "Bot running with Multi-Group Gender Routing!", 200
+    return "Bot running 24/7 with Multi-Group Reactions and Dynamic Flirt Dispatcher!", 200
 
 def run_web():
     port = int(os.environ.get("PORT", 8080))
@@ -238,48 +382,27 @@ def run_web():
 def send_id(message):
     bot.reply_to(message, f"Chat ID: {message.chat.id}")
 
-# 1. Ingestion: "MM B Approved" and "MM G Approved" groups
-@bot.message_handler(content_types=['text'], func=lambda m: m.chat.id in [MMB_APPROVED_CHAT_ID, MMG_APPROVED_CHAT_ID] and m.chat.id != 0)
-def handle_approved_ids(message):
-    if approved_col is None:
-        return
-
-    gender = "m" if message.chat.id == MMB_APPROVED_CHAT_ID else "f"
-    lines = message.text.strip().splitlines()
-    added_count = 0
-
-    for line in lines:
-        cleaned = line.strip().replace("@", "")
-        if cleaned.isdigit():
-            uid = int(cleaned)
-            approved_col.update_one(
-                {"user_id": uid},
-                {"$set": {"user_id": uid, "gender": gender}},
-                upsert=True
-            )
-            added_count += 1
-
-    if added_count > 0:
-        bot.reply_to(message, f"Registered {added_count} user(s) as {'Boy (m)' if gender == 'm' else 'Girl (f)'}.")
-
-# 2. Ingestion: "MM Memes" media storage
-@bot.message_handler(content_types=['photo', 'animation', 'video', 'document'], func=lambda m: m.chat.id == MM_MEMES_CHAT_ID and m.chat.id != 0)
-def index_memes(message):
-    if memes_col is not None:
-        memes_col.update_one(
-            {"message_id": message.message_id},
-            {"$set": {"message_id": message.message_id}},
+# 1. Media Uploads inside MMG Flirt and MMB Flirt (Source Storage Groups)
+@bot.message_handler(content_types=['photo', 'animation', 'video'],
+                     func=lambda m: m.chat.id in [MMG_FLIRT_CHAT_ID, MMB_FLIRT_CHAT_ID] and m.chat.id != 0)
+def index_flirt_media(message):
+    target_gender = "f" if message.chat.id == MMG_FLIRT_CHAT_ID else "m"
+    if flirt_media_col is not None:
+        flirt_media_col.update_one(
+            {"gender": target_gender, "message_id": message.message_id},
+            {"$set": {"gender": target_gender, "message_id": message.message_id}},
             upsert=True
         )
+        print(f"Indexed flirt media ID {message.message_id} for gender '{target_gender}'")
 
-# 3. Topic Creation in MMB or MMG
+# 2. Topic Creation in MMB or MMG
 @bot.message_handler(content_types=['forum_topic_created'], func=lambda m: m.chat.id in [MMB_CHAT_ID, MMG_CHAT_ID] and m.chat.id != 0)
 def on_topic_created(message):
     name = message.forum_topic_created.name.strip().lower()
     save_topic(message.chat.id, message.message_thread_id, name)
     bot.reply_to(message, f"Topic auto-linked to keyword: '{name}'")
 
-# 4. Topic Renamed/Edited in MMB or MMG
+# 3. Topic Renamed in MMB or MMG
 @bot.message_handler(content_types=['forum_topic_edited'], func=lambda m: m.chat.id in [MMB_CHAT_ID, MMG_CHAT_ID] and m.chat.id != 0)
 def on_topic_edited(message):
     if message.forum_topic_edited.name:
@@ -287,7 +410,7 @@ def on_topic_edited(message):
         update_topic_keyword(message.chat.id, message.message_thread_id, new_name)
         bot.reply_to(message, f"Topic updated to keyword: '{new_name}'")
 
-# 5. Media Uploads inside MMB or MMG topics
+# 4. Media Uploads inside MMB or MMG topics
 @bot.message_handler(content_types=['text', 'photo', 'animation', 'document', 'video', 'sticker'],
                      func=lambda m: m.chat.id in [MMB_CHAT_ID, MMG_CHAT_ID] and m.chat.id != 0)
 def index_media(message):
@@ -299,45 +422,50 @@ def index_media(message):
         if keyword:
             save_media(message.chat.id, keyword, message.message_id)
 
-# 6. User Verification & Gender-Based Reaction Dispatcher
-@bot.message_handler(content_types=['text'], func=lambda m: m.chat.id not in [
-    MMB_CHAT_ID, MMG_CHAT_ID, MMB_APPROVED_CHAT_ID, MMG_APPROVED_CHAT_ID, MM_MEMES_CHAT_ID
-])
-def handle_group_trigger(message):
-    # Ignore replies
-    if message.reply_to_message is not None:
+# 5. MM Memes Media Storage
+@bot.message_handler(content_types=['photo', 'animation', 'video', 'document'], func=lambda m: m.chat.id == MM_MEMES_CHAT_ID and m.chat.id != 0)
+def index_memes(message):
+    if memes_col is not None:
+        memes_col.update_one(
+            {"message_id": message.message_id},
+            {"$set": {"message_id": message.message_id}},
+            upsert=True
+        )
+
+# 6. Public Group Activity & Reaction Listener
+@bot.message_handler(content_types=['text', 'photo', 'animation', 'video', 'document', 'sticker'],
+                     func=lambda m: m.chat.id not in [MMB_CHAT_ID, MMG_CHAT_ID, MMB_FLIRT_CHAT_ID, MMG_FLIRT_CHAT_ID, MM_MEMES_CHAT_ID])
+def handle_public_group(message):
+    # Track presence of users who speak in public groups
+    track_activity(message.chat, message.from_user)
+
+    # Keywords apply only to plain text non-replies
+    if message.content_type != 'text' or message.reply_to_message is not None or not message.from_user:
         return
 
-    # Guard against anonymous group admins or channel posts
-    if not message.from_user:
-        return
-
-    user_id = message.from_user.id
-    gender = get_effective_gender(user_id)
-
-    # If user has no verified gender in approved groups or DB, DO NOT RESPOND
+    gender = get_user_gender(message.from_user.id)
     if not gender:
         return
 
     trigger = message.text.strip().lower()
     storage_chat_id = MMB_CHAT_ID if gender == "m" else MMG_CHAT_ID
-
     selected_msg_id = get_random_media(storage_chat_id, trigger)
 
     if selected_msg_id:
         try:
             reaction_queue.put_nowait(
-                (message.chat.id, storage_chat_id, selected_msg_id, message.message_id, trigger, time.time())
+                (message.chat.id, storage_chat_id, selected_msg_id, message.message_id, None, time.time())
             )
         except queue.Full:
             pass
 
-# 7. Start Registration Fallback (For 1-on-1 Chats)
+# 7. /start Gender Registration in Private Chat
 def get_gender_keyboard():
     keyboard = types.InlineKeyboardMarkup(row_width=2)
-    btn_male = types.InlineKeyboardButton("Male", callback_data="select_m")
-    btn_female = types.InlineKeyboardButton("Female", callback_data="select_f")
-    keyboard.add(btn_male, btn_female)
+    keyboard.add(
+        types.InlineKeyboardButton("Male", callback_data="select_m"),
+        types.InlineKeyboardButton("Female", callback_data="select_f")
+    )
     return keyboard
 
 @bot.message_handler(commands=['start'])
@@ -374,6 +502,11 @@ def handle_confirm(call):
             {"$set": {"user_id": call.from_user.id, "gender": gender}},
             upsert=True
         )
+        if group_members_col is not None:
+            group_members_col.update_many(
+                {"user_id": call.from_user.id},
+                {"$set": {"gender": gender}}
+            )
         bot.edit_message_text(f"Saved! You are registered as {'Male (m)' if gender == 'm' else 'Female (f)'}.", chat_id=call.message.chat.id, message_id=call.message.message_id)
     else:
         bot.edit_message_text("Database connection error. Please try again later.", chat_id=call.message.chat.id, message_id=call.message.message_id)
@@ -382,5 +515,6 @@ def handle_confirm(call):
 if __name__ == "__main__":
     threading.Thread(target=run_web, daemon=True).start()
     threading.Thread(target=process_queue, daemon=True).start()
+    threading.Thread(target=flirt_scheduler_loop, daemon=True).start()
     threading.Thread(target=daily_meme_pinner, daemon=True).start()
     bot.infinity_polling()
