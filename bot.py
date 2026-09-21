@@ -3,6 +3,7 @@ import random
 import threading
 import time
 import queue
+import html
 from datetime import datetime, timezone, timedelta
 from flask import Flask
 from pymongo import MongoClient
@@ -23,7 +24,7 @@ MM_MEMES_CHAT_ID = int(os.environ.get("MM_MEMES_CHAT_ID") or 0)
 bot = telebot.TeleBot(TOKEN)
 app = Flask(__name__)
 
-# Extract numeric bot ID directly from the token for instant admin checks
+# Extract numeric bot ID directly from token for instant admin checks
 try:
     BOT_ID = int(TOKEN.split(":")[0])
 except Exception:
@@ -54,8 +55,8 @@ if MONGO_URI:
 
         users_col = db["users"]                  # Gender registrations via /start
         group_members_col = db["group_members"]  # Member roster per group
-        public_groups_col = db["public_groups"]  # Target public groups (e.g. Walkie Talkies)
-        flirt_media_col = db["flirt_media"]      # Flirt media from source storage groups
+        public_groups_col = db["public_groups"]  # Target public groups
+        flirt_media_col = db["flirt_media"]      # Flirt media from storage vaults
         flirt_logs_col = db["flirt_logs"]        # Dispatched flirts tracker
         topics_col = db["topics"]                # Forum topic keywords for MMB/MMG
         media_col = db["media"]                  # Reaction media for MMB/MMG
@@ -77,7 +78,7 @@ if MONGO_URI:
 
 def is_storage_group(chat_id, title=""):
     """Returns True if the group is one of our private media vaults by ID or Title."""
-    if chat_id in [MMB_CHAT_ID, MMG_CHAT_ID, MMB_FLIRT_CHAT_ID, MMG_FLIRT_CHAT_ID, MM_MEMES_CHAT_ID]:
+    if chat_id != 0 and chat_id in [MMB_CHAT_ID, MMG_CHAT_ID, MMB_FLIRT_CHAT_ID, MMG_FLIRT_CHAT_ID, MM_MEMES_CHAT_ID]:
         return True
     title_clean = (title or "").strip().lower()
     return title_clean in STORAGE_GROUP_NAMES
@@ -185,75 +186,76 @@ def process_queue():
     while True:
         try:
             job = reaction_queue.get()
-            job_type = job.get("type")
-            queued_time = job.get("queued_time", time.time())
+            try:
+                job_type = job.get("type")
+                queued_time = job.get("queued_time", time.time())
 
-            # Drop stale triggers older than 45 seconds
-            if time.time() - queued_time <= 45:
-                target_chat_id = job["target_chat_id"]
-                storage_chat_id = job["storage_chat_id"]
-                media_msg_id = job["media_msg_id"]
+                # Drop stale triggers older than 45 seconds
+                if time.time() - queued_time <= 45:
+                    target_chat_id = job["target_chat_id"]
+                    storage_chat_id = job["storage_chat_id"]
+                    media_msg_id = job["media_msg_id"]
 
-                # Case A: Keyword Reaction in Public Group
-                if job_type == "reaction":
-                    reply_to_id = job.get("reply_to_id")
-                    try:
-                        bot.copy_message(
-                            chat_id=target_chat_id,
-                            from_chat_id=storage_chat_id,
-                            message_id=media_msg_id,
-                            reply_to_message_id=reply_to_id
-                        )
-                    except ApiTelegramException as e:
-                        err_msg = str(e).lower()
-                        if "replied message not found" in err_msg or "reply" in err_msg:
-                            try:
-                                bot.copy_message(
-                                    chat_id=target_chat_id,
-                                    from_chat_id=storage_chat_id,
-                                    message_id=media_msg_id
-                                )
-                            except Exception:
-                                pass
-                        elif "message to copy not found" in err_msg or "message can't be copied" in err_msg:
-                            remove_dead_media(storage_chat_id, media_msg_id)
-                    except Exception as e:
-                        print(f"Reaction transfer error: {e}")
+                    # Case A: Keyword Reaction in Public Group
+                    if job_type == "reaction":
+                        reply_to_id = job.get("reply_to_id")
+                        try:
+                            bot.copy_message(
+                                chat_id=target_chat_id,
+                                from_chat_id=storage_chat_id,
+                                message_id=media_msg_id,
+                                reply_to_message_id=reply_to_id
+                            )
+                        except ApiTelegramException as e:
+                            err_msg = str(e).lower()
+                            if "replied message not found" in err_msg or "reply" in err_msg:
+                                try:
+                                    bot.copy_message(
+                                        chat_id=target_chat_id,
+                                        from_chat_id=storage_chat_id,
+                                        message_id=media_msg_id
+                                    )
+                                except Exception:
+                                    pass
+                            elif "message to copy not found" in err_msg or "message can't be copied" in err_msg:
+                                remove_dead_media(storage_chat_id, media_msg_id)
+                        except Exception as e:
+                            print(f"Reaction transfer error: {e}")
 
-                # Case B: Flirt Dispatch (Send Meme first -> Then Tag in Reply)
-                elif job_type == "flirt":
-                    user_id = job["user_id"]
-                    first_name = job["first_name"]
-                    try:
-                        # 1. Send the meme from the storage group into target group (e.g. Walkie Talkies)
-                        sent_msg = bot.copy_message(
-                            chat_id=target_chat_id,
-                            from_chat_id=storage_chat_id,
-                            message_id=media_msg_id
-                        )
-                        sent_msg_id = getattr(sent_msg, 'message_id', sent_msg)
+                    # Case B: Flirt Dispatch
+                    elif job_type == "flirt":
+                        user_id = job["user_id"]
+                        first_name = job["first_name"]
+                        try:
+                            sent_msg = bot.copy_message(
+                                chat_id=target_chat_id,
+                                from_chat_id=storage_chat_id,
+                                message_id=media_msg_id
+                            )
+                            sent_msg_id = getattr(sent_msg, 'message_id', sent_msg)
 
-                        # Small 1-second pause before replying with mention
-                        time.sleep(1)
+                            time.sleep(1)
 
-                        # 2. Tag the target user as a direct reply without saying "Hey"
-                        clean_name = first_name.replace('[', '').replace(']', '')
-                        mention = f"[{clean_name}](tg://user?id={user_id})"
-                        bot.send_message(
-                            chat_id=target_chat_id,
-                            text=mention,
-                            reply_to_message_id=sent_msg_id,
-                            parse_mode="Markdown"
-                        )
-                    except ApiTelegramException as e:
-                        err_msg = str(e).lower()
-                        if "message to copy not found" in err_msg or "message can't be copied" in err_msg:
-                            remove_dead_media(storage_chat_id, media_msg_id)
-                    except Exception as e:
-                        print(f"Flirt transfer error: {e}")
+                            # HTML mention format avoids Markdown special character parsing errors
+                            escaped_name = html.escape(first_name)
+                            mention = f'<a href="tg://user?id={user_id}">{escaped_name}</a>'
+                            bot.send_message(
+                                chat_id=target_chat_id,
+                                text=mention,
+                                reply_to_message_id=sent_msg_id,
+                                parse_mode="HTML"
+                            )
+                        except ApiTelegramException as e:
+                            err_msg = str(e).lower()
+                            if "message to copy not found" in err_msg or "message can't be copied" in err_msg:
+                                remove_dead_media(storage_chat_id, media_msg_id)
+                        except Exception as e:
+                            print(f"Flirt transfer error: {e}")
 
-            reaction_queue.task_done()
-            time.sleep(2)  # 2-second rate-limit buffer to protect 0.1 CPU
+            finally:
+                reaction_queue.task_done()
+
+            time.sleep(2)  # Rate-limit buffer to keep CPU consumption minimal
 
         except Exception as e:
             print(f"Queue worker exception: {e}")
@@ -278,7 +280,7 @@ def generate_daily_schedule():
     return sorted([m1, m2, a1, e1, e2])
 
 def dispatch_flirts_for_slot(slot_index):
-    """Evaluates genuine public groups (e.g. Walkie Talkies) and dispatches flirts."""
+    """Evaluates genuine public groups and dispatches flirts."""
     if public_groups_col is None or group_members_col is None or flirt_media_col is None or flirt_logs_col is None:
         return
 
@@ -305,7 +307,6 @@ def dispatch_flirts_for_slot(slot_index):
         if female_media and MMG_FLIRT_CHAT_ID != 0:
             verified_girls = list(group_members_col.find({"chat_id": group_id, "gender": "f"}))
             total_girls = len(verified_girls)
-
             active_slots = min(total_girls, 5)
 
             if slot_index < active_slots:
@@ -339,7 +340,6 @@ def dispatch_flirts_for_slot(slot_index):
         if male_media and MMB_FLIRT_CHAT_ID != 0:
             verified_boys = list(group_members_col.find({"chat_id": group_id, "gender": "m"}))
             total_boys = len(verified_boys)
-
             active_slots = min(total_boys, 5)
 
             if slot_index < active_slots:
@@ -399,10 +399,10 @@ def flirt_scheduler_loop():
 
         time.sleep(60)
 
-# ---------------- DAILY RANDOM MORNING MEME PINNER ----------------
+# ---------------- DAILY RANDOM MORNING MEME PINNER (FIXED) ----------------
 
 def daily_meme_pinner():
-    """Picks and pins a random meme in MM Memes every morning at a random time."""
+    """Picks and posts a random meme in MM Memes every morning; pins if permission is present."""
     tz_ist = timezone(timedelta(hours=5, minutes=30))
     pinned_today_date = None
     target_hour = random.randint(7, 10)
@@ -415,35 +415,57 @@ def daily_meme_pinner():
             curr_mins = now.hour * 60 + now.minute
             target_mins = target_hour * 60 + target_minute
 
-            if pinned_today_date != today_str:
-                if curr_mins >= target_mins:
-                    if memes_col is not None and MM_MEMES_CHAT_ID != 0:
-                        memes = list(memes_col.find())
-                        if memes:
-                            selected_meme = random.choice(memes)["message_id"]
+            if pinned_today_date != today_str and curr_mins >= target_mins:
+                if memes_col is None or MM_MEMES_CHAT_ID == 0:
+                    pinned_today_date = today_str
+                else:
+                    memes = list(memes_col.find())
+                    if not memes:
+                        print("No memes found in database to post.")
+                        pinned_today_date = today_str
+                    else:
+                        selected_meme = random.choice(memes)["message_id"]
+                        try:
+                            sent = bot.copy_message(
+                                chat_id=MM_MEMES_CHAT_ID,
+                                from_chat_id=MM_MEMES_CHAT_ID,
+                                message_id=selected_meme
+                            )
+                            # Update date immediately so failed pins or minor errors won't trigger re-sends
+                            pinned_today_date = today_str
+
+                            # Attempt to pin; ignore gracefully if missing permission
                             try:
-                                sent = bot.copy_message(
-                                    chat_id=MM_MEMES_CHAT_ID,
-                                    from_chat_id=MM_MEMES_CHAT_ID,
-                                    message_id=selected_meme
-                                )
                                 bot.pin_chat_message(
                                     chat_id=MM_MEMES_CHAT_ID,
                                     message_id=sent.message_id,
                                     disable_notification=False
                                 )
-                                pinned_today_date = today_str
-                                target_hour = random.randint(7, 10)
-                                target_minute = random.randint(0, 59)
                                 print(f"Daily meme pinned successfully on {today_str}.")
-                            except ApiTelegramException as e:
-                                err_msg = str(e).lower()
-                                if "message to copy not found" in err_msg or "message can't be copied" in err_msg:
-                                    memes_col.delete_one({"message_id": selected_meme})
-                            except Exception as e:
-                                print(f"Failed to pin daily meme: {e}")
+                            except ApiTelegramException as pin_err:
+                                print(f"Daily meme sent, but could not pin (missing permission): {pin_err}")
+                            except Exception as pin_err:
+                                print(f"Daily meme pin error: {pin_err}")
+
+                            # Reschedule target time for next day
+                            target_hour = random.randint(7, 10)
+                            target_minute = random.randint(0, 59)
+
+                        except ApiTelegramException as e:
+                            err_msg = str(e).lower()
+                            if "message to copy not found" in err_msg or "message can't be copied" in err_msg:
+                                memes_col.delete_one({"message_id": selected_meme})
+                                print(f"Purged deleted meme message ID {selected_meme}")
+                            else:
+                                print(f"Telegram API error posting daily meme: {e}")
+                                # Mark completed if permissions prevent sending altogether to stop retry floods
+                                if "forbidden" in err_msg or "rights" in err_msg:
+                                    pinned_today_date = today_str
+                        except Exception as e:
+                            print(f"Failed to post daily meme: {e}")
+
         except Exception as e:
-            print(f"Meme scheduler error: {e}")
+            print(f"Meme scheduler loop error: {e}")
 
         time.sleep(60)
 
@@ -451,17 +473,15 @@ def daily_meme_pinner():
 
 def notify_deployment():
     """Sends a verification message to storage groups once deployment is active."""
-    time.sleep(3)  # Brief pause to allow internet connections to stabilize
+    time.sleep(3)
 
-    # Notify MM Memes
     if MM_MEMES_CHAT_ID != 0:
         try:
-            bot.send_message(MM_MEMES_CHAT_ID, "you can use this group to store the memes.")
+            bot.send_message(MM_MEMES_CHAT_ID, "You can use this group to store the memes.")
             print("Deployment notification sent to MM Memes.")
         except Exception as e:
             print(f"Failed to send deployment message to MM Memes: {e}")
 
-    # Notify MMB Flirt
     if MMB_FLIRT_CHAT_ID != 0:
         try:
             bot.send_message(MMB_FLIRT_CHAT_ID, "You can use this group now to store flirt images.")
@@ -469,7 +489,6 @@ def notify_deployment():
         except Exception as e:
             print(f"Failed to send deployment message to MMB Flirt: {e}")
 
-    # Notify MMG Flirt
     if MMG_FLIRT_CHAT_ID != 0:
         try:
             bot.send_message(MMG_FLIRT_CHAT_ID, "You can use this group now to store flirt images.")
@@ -516,12 +535,22 @@ def handle_gender_selection(call):
         types.InlineKeyboardButton("Confirm", callback_data=f"confirm_{selected}"),
         types.InlineKeyboardButton("Change", callback_data="change_gender")
     )
-    bot.edit_message_text(f"Selected: {name}\nClick Confirm to save.", chat_id=call.message.chat.id, message_id=call.message.message_id, reply_markup=keyboard)
+    bot.edit_message_text(
+        f"Selected: {name}\nClick Confirm to save.",
+        chat_id=call.message.chat.id,
+        message_id=call.message.message_id,
+        reply_markup=keyboard
+    )
 
 @bot.callback_query_handler(func=lambda call: call.data == "change_gender")
 def handle_change(call):
     bot.answer_callback_query(call.id)
-    bot.edit_message_text("Select your gender:", chat_id=call.message.chat.id, message_id=call.message.message_id, reply_markup=get_gender_keyboard())
+    bot.edit_message_text(
+        "Select your gender:",
+        chat_id=call.message.chat.id,
+        message_id=call.message.message_id,
+        reply_markup=get_gender_keyboard()
+    )
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("confirm_"))
 def handle_confirm(call):
@@ -539,13 +568,23 @@ def handle_confirm(call):
                 {"user_id": call.from_user.id},
                 {"$set": {"gender": gender}}
             )
-        bot.edit_message_text(f"Saved! You are registered as {'Male (m)' if gender == 'm' else 'Female (f)'}.", chat_id=call.message.chat.id, message_id=call.message.message_id)
+        bot.edit_message_text(
+            f"Saved! You are registered as {'Male (m)' if gender == 'm' else 'Female (f)'}.",
+            chat_id=call.message.chat.id,
+            message_id=call.message.message_id
+        )
     else:
-        bot.edit_message_text("Database connection error. Please try again later.", chat_id=call.message.chat.id, message_id=call.message.message_id)
+        bot.edit_message_text(
+            "Database connection error. Please try again later.",
+            chat_id=call.message.chat.id,
+            message_id=call.message.message_id
+        )
 
 # C. Media Uploads inside MMG Flirt and MMB Flirt (Source Storage Groups)
-@bot.message_handler(content_types=['photo', 'animation', 'video'],
-                     func=lambda m: (m.chat.id in [MMG_FLIRT_CHAT_ID, MMB_FLIRT_CHAT_ID] or (m.chat.title or "").strip().lower() in ["mmg flirt", "mmb flirt"]))
+@bot.message_handler(
+    content_types=['photo', 'animation', 'video'],
+    func=lambda m: (m.chat.id in [MMG_FLIRT_CHAT_ID, MMB_FLIRT_CHAT_ID] or (m.chat.title or "").strip().lower() in ["mmg flirt", "mmb flirt"])
+)
 def index_flirt_media(message):
     title_lower = (message.chat.title or "").strip().lower()
     target_gender = "f" if (message.chat.id == MMG_FLIRT_CHAT_ID or title_lower == "mmg flirt") else "m"
@@ -558,14 +597,20 @@ def index_flirt_media(message):
         print(f"Indexed flirt media ID {message.message_id} for gender '{target_gender}'")
 
 # D. Topic Creation in MMB or MMG
-@bot.message_handler(content_types=['forum_topic_created'], func=lambda m: m.chat.id in [MMB_CHAT_ID, MMG_CHAT_ID] and m.chat.id != 0)
+@bot.message_handler(
+    content_types=['forum_topic_created'],
+    func=lambda m: m.chat.id in [MMB_CHAT_ID, MMG_CHAT_ID] and m.chat.id != 0
+)
 def on_topic_created(message):
     name = message.forum_topic_created.name.strip().lower()
     save_topic(message.chat.id, message.message_thread_id, name)
     bot.reply_to(message, f"Topic auto-linked to keyword: '{name}'")
 
 # E. Topic Renamed in MMB or MMG
-@bot.message_handler(content_types=['forum_topic_edited'], func=lambda m: m.chat.id in [MMB_CHAT_ID, MMG_CHAT_ID] and m.chat.id != 0)
+@bot.message_handler(
+    content_types=['forum_topic_edited'],
+    func=lambda m: m.chat.id in [MMB_CHAT_ID, MMG_CHAT_ID] and m.chat.id != 0
+)
 def on_topic_edited(message):
     if message.forum_topic_edited.name:
         new_name = message.forum_topic_edited.name.strip().lower()
@@ -573,8 +618,10 @@ def on_topic_edited(message):
         bot.reply_to(message, f"Topic updated to keyword: '{new_name}'")
 
 # F. Media Uploads inside MMB or MMG topics
-@bot.message_handler(content_types=['text', 'photo', 'animation', 'document', 'video', 'sticker'],
-                     func=lambda m: m.chat.id in [MMB_CHAT_ID, MMG_CHAT_ID] and m.chat.id != 0)
+@bot.message_handler(
+    content_types=['text', 'photo', 'animation', 'document', 'video', 'sticker'],
+    func=lambda m: m.chat.id in [MMB_CHAT_ID, MMG_CHAT_ID] and m.chat.id != 0
+)
 def index_media(message):
     if message.text and message.text.startswith('/'):
         return
@@ -585,7 +632,10 @@ def index_media(message):
             save_media(message.chat.id, keyword, message.message_id)
 
 # G. MM Memes Media Storage
-@bot.message_handler(content_types=['photo', 'animation', 'video', 'document'], func=lambda m: m.chat.id == MM_MEMES_CHAT_ID and m.chat.id != 0)
+@bot.message_handler(
+    content_types=['photo', 'animation', 'video', 'document'],
+    func=lambda m: m.chat.id == MM_MEMES_CHAT_ID and m.chat.id != 0
+)
 def index_memes(message):
     if memes_col is not None:
         memes_col.update_one(
@@ -594,14 +644,14 @@ def index_memes(message):
             upsert=True
         )
 
-# H. Public Group Activity & Reaction Listener (Only runs on genuine public chat groups)
-@bot.message_handler(content_types=['text', 'photo', 'animation', 'video', 'document', 'sticker'],
-                     func=lambda m: m.chat.type in ['group', 'supergroup'] and not is_storage_group(m.chat.id, m.chat.title))
+# H. Public Group Activity & Reaction Listener
+@bot.message_handler(
+    content_types=['text', 'photo', 'animation', 'video', 'document', 'sticker'],
+    func=lambda m: m.chat.type in ['group', 'supergroup'] and not is_storage_group(m.chat.id, m.chat.title)
+)
 def handle_public_group(message):
-    # Track presence of users who speak in public groups
     track_activity(message.chat, message.from_user)
 
-    # Keywords apply only to plain text non-replies
     if message.content_type != 'text' or message.reply_to_message is not None or not message.from_user:
         return
 
