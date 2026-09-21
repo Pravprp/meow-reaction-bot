@@ -181,6 +181,16 @@ def remove_dead_media(chat_id, msg_id):
         memes_col.delete_one({"message_id": msg_id})
     print(f"Purged deleted media ID {msg_id} from group {chat_id}")
 
+# ---------------- KEEP-ALIVE SERVER ----------------
+
+@app.route('/')
+def home():
+    return "Bot running 24/7 with Multi-Group Reactions and Dynamic Flirt Dispatcher!", 200
+
+def run_web():
+    port = int(os.environ.get("PORT", 8080))
+    app.run(host="0.0.0.0", port=port)
+
 # ---------------- QUEUE WORKER (ONE BY ONE, 2s GAP) ----------------
 
 def process_queue():
@@ -514,7 +524,7 @@ def index_memes(message):
         )
         print(f"Indexed meme ID {message.message_id} in MM Memes storage.")
 
-# E. Topic Creation in MMB or MMG (Auto-reply restored)
+# E. Topic Creation in MMB or MMG (Auto-reply enabled)
 @bot.message_handler(content_types=['forum_topic_created'],
                      func=lambda m: (m.chat.id in [MMB_CHAT_ID, MMG_CHAT_ID] or (m.chat.title or "").strip().lower() in ["mmb", "mmg"]) and m.chat.id != 0)
 def on_topic_created(message):
@@ -525,7 +535,7 @@ def on_topic_created(message):
     except Exception as e:
         print(f"Error replying to topic creation: {e}")
 
-# F. Topic Renamed in MMB or MMG (Auto-reply restored)
+# F. Topic Renamed in MMB or MMG (Auto-reply enabled)
 @bot.message_handler(content_types=['forum_topic_edited'],
                      func=lambda m: (m.chat.id in [MMB_CHAT_ID, MMG_CHAT_ID] or (m.chat.title or "").strip().lower() in ["mmb", "mmg"]) and m.chat.id != 0)
 def on_topic_edited(message):
@@ -587,4 +597,4 @@ if __name__ == "__main__":
     threading.Thread(target=process_queue, daemon=True).start()
     threading.Thread(target=flirt_scheduler_loop, daemon=True).start()
     threading.Thread(target=notify_deployment, daemon=True).start()
-    bot.infinity_polling()
+    bot.infinity_polling(skip_pending=True)
