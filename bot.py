@@ -452,29 +452,24 @@ def daily_meme_pinner():
 # ---------------- DEPLOYMENT NOTIFICATION TASK ----------------
 
 def notify_deployment():
-    """Sends a verification message to storage groups once deployment is active."""
-    time.sleep(3)
+    """Sends a verification message to all 5 storage groups once deployment is active."""
+    time.sleep(3)  # Brief pause to allow connections to stabilize
 
-    if MM_MEMES_CHAT_ID != 0:
-        try:
-            bot.send_message(MM_MEMES_CHAT_ID, "you can use this group to store the memes.")
-            print("Deployment notification sent to MM Memes.")
-        except Exception as e:
-            print(f"Failed to send deployment message to MM Memes: {e}")
+    storage_targets = [
+        ("MMB", MMB_CHAT_ID),
+        ("MMG", MMG_CHAT_ID),
+        ("MMB Flirt", MMB_FLIRT_CHAT_ID),
+        ("MMG Flirt", MMG_FLIRT_CHAT_ID),
+        ("MM Memes", MM_MEMES_CHAT_ID)
+    ]
 
-    if MMB_FLIRT_CHAT_ID != 0:
-        try:
-            bot.send_message(MMB_FLIRT_CHAT_ID, "You can use this group now to store flirt images.")
-            print("Deployment notification sent to MMB Flirt.")
-        except Exception as e:
-            print(f"Failed to send deployment message to MMB Flirt: {e}")
-
-    if MMG_FLIRT_CHAT_ID != 0:
-        try:
-            bot.send_message(MMG_FLIRT_CHAT_ID, "You can use this group now to store flirt images.")
-            print("Deployment notification sent to MMG Flirt.")
-        except Exception as e:
-            print(f"Failed to send deployment message to MMG Flirt: {e}")
+    for name, chat_id in storage_targets:
+        if chat_id != 0:
+            try:
+                bot.send_message(chat_id, "You can use this group now.")
+                print(f"Deployment notification sent to {name}.")
+            except Exception as e:
+                print(f"Failed to send deployment message to {name}: {e}")
 
 # ---------------- KEEP-ALIVE SERVER ----------------
 @app.route('/')
@@ -597,16 +592,14 @@ def index_memes(message):
 @bot.message_handler(content_types=['text', 'photo', 'animation', 'video', 'document', 'sticker'],
                      func=lambda m: m.chat.type in ['group', 'supergroup'] and not is_storage_group(m.chat.id, m.chat.title))
 def handle_public_group(message):
-    # Track presence of users who speak in public groups
     track_activity(message.chat, message.from_user)
 
-    # Keywords apply only to plain text non-replies
     if message.content_type != 'text' or message.reply_to_message is not None or not message.from_user:
         return
 
     text_clean = message.text.strip().lower()
 
-    # 1. On-Demand Meme Trigger: triggers on the word "meme", max 5 per day per group, regardless of gender registration
+    # 1. On-Demand Meme Trigger: triggers on the word "meme", max 5 per day per group
     if re.search(r'\bmeme\b', text_clean):
         tz_ist = timezone(timedelta(hours=5, minutes=30))
         today_str = datetime.now(tz_ist).strftime("%Y-%m-%d")
@@ -634,7 +627,7 @@ def handle_public_group(message):
                         })
                     except queue.Full:
                         pass
-                    return  # Return early so it doesn't process standard keyword reactions
+                    return
 
     # 2. Gender-Based Topic Keyword Reactions
     gender = get_user_gender(message.from_user.id)
