@@ -56,7 +56,7 @@ if MONGO_URI:
 
         users_col = db["users"]                  # Gender registrations via /start
         group_members_col = db["group_members"]  # Member roster per group
-        public_groups_col = db["public_groups"]  # Target public groups (e.g. Walkie Talkies)
+        public_groups_col = db["public_groups"]  # Target public groups
         flirt_media_col = db["flirt_media"]      # Flirt media from source storage groups
         flirt_logs_col = db["flirt_logs"]        # Dispatched flirts tracker
         topics_col = db["topics"]                # Forum topic keywords for MMB/MMG
@@ -80,7 +80,7 @@ if MONGO_URI:
 # ---------------- DATABASE & HELPER FUNCTIONS ----------------
 
 def is_storage_group(chat_id, title=""):
-    """Returns True if the group is one of our private media vaults by ID or Title."""
+    """Returns True if the group is one of the private media vaults by ID or Title."""
     if chat_id in [MMB_CHAT_ID, MMG_CHAT_ID, MMB_FLIRT_CHAT_ID, MMG_FLIRT_CHAT_ID, MM_MEMES_CHAT_ID]:
         return True
     title_clean = (title or "").strip().lower()
@@ -404,7 +404,7 @@ def flirt_scheduler_loop():
 # ---------------- DAILY RANDOM MORNING MEME PINNER ----------------
 
 def daily_meme_pinner():
-    """Picks and pins a random meme in MM Memes every morning at a random time."""
+    """Picks a random meme from MM Memes storage and pins it across all public admin groups."""
     tz_ist = timezone(timedelta(hours=5, minutes=30))
     pinned_today_date = None
     target_hour = random.randint(7, 10)
@@ -419,31 +419,60 @@ def daily_meme_pinner():
 
             if pinned_today_date != today_str:
                 if curr_mins >= target_mins:
-                    if memes_col is not None and MM_MEMES_CHAT_ID != 0:
+                    if (
+                        memes_col is not None
+                        and public_groups_col is not None
+                        and MM_MEMES_CHAT_ID != 0
+                    ):
                         memes = list(memes_col.find())
-                        if memes:
+                        public_groups = list(public_groups_col.find())
+
+                        if memes and public_groups:
                             selected_meme = random.choice(memes)["message_id"]
-                            try:
-                                sent = bot.copy_message(
-                                    chat_id=MM_MEMES_CHAT_ID,
-                                    from_chat_id=MM_MEMES_CHAT_ID,
-                                    message_id=selected_meme
-                                )
-                                bot.pin_chat_message(
-                                    chat_id=MM_MEMES_CHAT_ID,
-                                    message_id=sent.message_id,
-                                    disable_notification=False
-                                )
-                                pinned_today_date = today_str
-                                target_hour = random.randint(7, 10)
-                                target_minute = random.randint(0, 59)
-                                print(f"Daily meme pinned successfully on {today_str}.")
-                            except ApiTelegramException as e:
-                                err_msg = str(e).lower()
-                                if "message to copy not found" in err_msg or "message can't be copied" in err_msg:
-                                    memes_col.delete_one({"message_id": selected_meme})
-                            except Exception as e:
-                                print(f"Failed to pin daily meme: {e}")
+
+                            for group in public_groups:
+                                group_id = group["chat_id"]
+                                group_title = group.get("title", "")
+
+                                # Safeguard: Skip vault groups and groups without admin permissions
+                                if is_storage_group(group_id, group_title):
+                                    continue
+                                if not is_bot_admin(group_id):
+                                    continue
+
+                                try:
+                                    # 1. Copy the meme from the storage vault into the target group
+                                    sent = bot.copy_message(
+                                        chat_id=group_id,
+                                        from_chat_id=MM_MEMES_CHAT_ID,
+                                        message_id=selected_meme
+                                    )
+
+                                    # 2. Pin the sent meme in the target group
+                                    bot.pin_chat_message(
+                                        chat_id=group_id,
+                                        message_id=sent.message_id,
+                                        disable_notification=False
+                                    )
+                                    print(f"Meme pinned successfully in {group_title} ({group_id}).")
+
+                                    # Small 1-second pause between groups to avoid Telegram burst limits
+                                    time.sleep(1)
+
+                                except ApiTelegramException as e:
+                                    err_msg = str(e).lower()
+                                    if "message to copy not found" in err_msg or "message can't be copied" in err_msg:
+                                        memes_col.delete_one({"message_id": selected_meme})
+                                        break
+                                    print(f"Failed to pin meme in group {group_id}: {e}")
+                                except Exception as e:
+                                    print(f"Error dispatching meme to {group_id}: {e}")
+
+                            pinned_today_date = today_str
+                            target_hour = random.randint(7, 10)
+                            target_minute = random.randint(0, 59)
+                            print(f"Daily meme broadcast finished for {today_str}.")
+
         except Exception as e:
             print(f"Meme scheduler error: {e}")
 
@@ -452,21 +481,66 @@ def daily_meme_pinner():
 # ---------------- DEPLOYMENT NOTIFICATION TASK ----------------
 
 def notify_deployment():
-    """Sends a verification message to all 5 storage groups once deployment is active."""
+    """Sends role and usage instructions to all 5 storage groups once deployment is active."""
     time.sleep(3)  # Brief pause to allow connections to stabilize
 
     storage_targets = [
-        ("MMB", MMB_CHAT_ID),
-        ("MMG", MMG_CHAT_ID),
-        ("MMB Flirt", MMB_FLIRT_CHAT_ID),
-        ("MMG Flirt", MMG_FLIRT_CHAT_ID),
-        ("MM Memes", MM_MEMES_CHAT_ID)
+        (
+            "MMB",
+            MMB_CHAT_ID,
+            "🤖 *MMB Vault is Online!*\n\n"
+            "*Purpose:* Storage vault for male keyword reaction media.\n\n"
+            "*How it works & how to use it:*\n"
+            "• Create a forum topic titled with your trigger keyword (e.g., `sad`, `cool`, `bye`).\n"
+            "• Send media (photos, GIFs, videos, stickers) inside that topic.\n"
+            "• When a registered male member says that keyword in an active public group, the bot pulls random media from here to reply."
+        ),
+        (
+            "MMG",
+            MMG_CHAT_ID,
+            "🤖 *MMG Vault is Online!*\n\n"
+            "*Purpose:* Storage vault for female keyword reaction media.\n\n"
+            "*How it works & how to use it:*\n"
+            "• Create a forum topic titled with your trigger keyword (e.g., `happy`, `angry`, `hello`).\n"
+            "• Send media (photos, GIFs, videos, stickers) inside that topic.\n"
+            "• When a registered female member says that keyword in an active public group, the bot pulls random media from here to reply."
+        ),
+        (
+            "MMB Flirt",
+            MMB_FLIRT_CHAT_ID,
+            "🤖 *MMB Flirt Vault is Online!*\n\n"
+            "*Purpose:* Media vault for flirts targeted at male members.\n\n"
+            "*How it works & how to use it:*\n"
+            "• Upload photos, animations, or videos directly into this group.\n"
+            "• The bot automatically indexes every item under the male flirt catalog.\n"
+            "• During daily scheduled flirt slots, the bot posts a media item from here into public groups and tags an eligible male user in the reply."
+        ),
+        (
+            "MMG Flirt",
+            MMG_FLIRT_CHAT_ID,
+            "🤖 *MMG Flirt Vault is Online!*\n\n"
+            "*Purpose:* Media vault for flirts targeted at female members.\n\n"
+            "*How it works & how to use it:*\n"
+            "• Upload photos, animations, or videos directly into this group.\n"
+            "• The bot automatically indexes every item under the female flirt catalog.\n"
+            "• During daily scheduled flirt slots, the bot posts a media item from here into public groups and tags an eligible female user in the reply."
+        ),
+        (
+            "MM Memes",
+            MM_MEMES_CHAT_ID,
+            "🤖 *MM Memes Vault is Online!*\n\n"
+            "*Purpose:* Central storage vault for general memes.\n\n"
+            "*How it works & how to use it:*\n"
+            "• Upload photos, videos, or animations here to add them to the meme repository.\n"
+            "• *On-Demand:* When a user types `meme` in a public group, the bot copies a meme from here as a reply (limit 5 per day per group).\n"
+            "• *Daily Morning Pin:* Every morning between 7:00 AM and 11:00 AM IST, the bot randomly selects a meme from here and pins it across all public groups where it is an admin."
+        )
     ]
 
-    for name, chat_id in storage_targets:
+    for name, chat_id, message_text in storage_targets:
         if chat_id != 0:
             try:
-                bot.send_message(chat_id, "You can use this group now.")
+                bot.send_message(chat_id, message_text, parse_mode="Markdown")
                 print(f"Deployment notification sent to {name}.")
             except Exception as e:
                 print(f"Failed to send deployment message to {name}: {e}")
